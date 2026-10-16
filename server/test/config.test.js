@@ -12,17 +12,29 @@ test('runtime configuration rejects a missing database URL', () => {
   assert.throws(() => validateRuntimeConfig(config), /DATABASE_URL/)
 })
 
-test('production requires HTTPS frontend and a strong device key', () => {
+test('production requires HTTPS and legacy device authentication is opt-in with a near cutoff', () => {
   const base = {
     NODE_ENV: 'production',
     DATABASE_URL: 'postgresql://localhost/test',
     JWT_SECRET: 'a'.repeat(40),
     FRONTEND_URL: 'https://example.test'
   }
-  assert.throws(() => validateRuntimeConfig(createConfig(base)), /DEVICE_API_KEY/)
+  assert.doesNotThrow(() => validateRuntimeConfig(createConfig(base)))
   assert.throws(
-    () => validateRuntimeConfig(createConfig({ ...base, DEVICE_API_KEY: 'b'.repeat(40), FRONTEND_URL: 'http://example.test' })),
+    () => validateRuntimeConfig(createConfig({ ...base, FRONTEND_URL: 'http://example.test' })),
     /HTTPS/
   )
-  assert.doesNotThrow(() => validateRuntimeConfig(createConfig({ ...base, DEVICE_API_KEY: 'b'.repeat(40) })))
+  assert.throws(() => validateRuntimeConfig(createConfig({ ...base, ALLOW_LEGACY_DEVICE_API_KEY: 'true' })), /explicit cutoff/)
+  assert.throws(() => validateRuntimeConfig(createConfig({
+    ...base,
+    ALLOW_LEGACY_DEVICE_API_KEY: 'true',
+    LEGACY_DEVICE_API_KEY: 'b'.repeat(40),
+    LEGACY_DEVICE_API_KEY_EXPIRES_AT: new Date(Date.now() - 1000).toISOString()
+  })), /explicit cutoff/)
+  assert.doesNotThrow(() => validateRuntimeConfig(createConfig({
+    ...base,
+    ALLOW_LEGACY_DEVICE_API_KEY: 'true',
+    LEGACY_DEVICE_API_KEY: 'b'.repeat(40),
+    LEGACY_DEVICE_API_KEY_EXPIRES_AT: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+  })))
 })

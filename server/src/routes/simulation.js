@@ -3,12 +3,13 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { prisma } from '../db.js'
 import { authMiddleware } from '../middleware/auth.js'
-import { verifyDeviceIngestion } from '../middleware/deviceAuth.js'
+import { consumeDeviceRequest, verifyDeviceIngestion } from '../middleware/deviceAuth.js'
 import { config } from '../config.js'
 import { validateBody } from '../middleware/validate.js'
 import { getIO } from '../socket.js'
 import { isObservationCurrent } from '../parkingObservations.js'
 import { hasFacilityAccess } from '../tenantAccess.js'
+import { logProcessError } from '../safeLogging.js'
 
 const router = Router()
 
@@ -187,7 +188,7 @@ async function simulationTick() {
     state.updatesCount += 1
     await emitLiveSummary(state.facilityId, changedSlots.length)
   } catch (error) {
-    console.error('[simulationTick]', error)
+    logProcessError('simulation_tick_error', error)
   } finally {
     state.isTicking = false
   }
@@ -274,116 +275,80 @@ router.post('/pi-payload', simulationAllowed, verifyDeviceIngestion, validateBod
   try {
     const { parking_id: facilityId, device_id: deviceId, slots, device_health: deviceHealth } = req.body
     const observedAt = new Date(req.body.timestamp)
+    const result = await prisma.$transaction(async (tx) => {
+      await consumeDeviceRequest(tx, req.deviceAuth)
+      const sourceDevice = await tx.device.findUnique({
+        where: { id: req.deviceAuth.device.id },
+        include: { facility: { select: { organizationId: true } } }
+      })
+      const deviceIdMatches = sourceDevice && (deviceId === sourceDevice.id || (req.deviceAuth.legacy && deviceId === sourceDevice.deviceCode))
+      if (!sourceDevice?.facility.organizationId || sourceDevice.facilityId !== facilityId || !deviceIdMatches) {
+        const error = new Error('Invalid device authentication.')
+        error.statusCode = 401
+        throw error
+      }
+      let observationsStored = 0
+      let staleOrConflicting = 0
 
-    const facility = await prisma.facility.findUnique({ where: { id: facilityId }, select: { id: true } })
-    if (!facility) {
-      const error = new Error('Facility not found.')
-      error.statusCode = 404
-      throw error
-    }
-
-    const assignedFacility = await prisma.facility.findUnique({ where: { id: facilityId }, select: { organizationId: true } })
-    if (!assignedFacility?.organizationId) {
-      const error = new Error('Facility is not assigned to an organization.')
-      error.statusCode = 409
-      throw error
-    }
-
-    const sourceDevice = await prisma.device.findFirst({
-      where: { facilityId, OR: [{ id: deviceId }, { deviceCode: deviceId }] },
-      select: { id: true, facility: { select: { organizationId: true } } }
-    })
-    if (!sourceDevice) {
-      const error = new Error('Registered device not found for this facility.')
-      error.statusCode = 404
-      throw error
-    }
-    if (sourceDevice.facility.organizationId !== assignedFacility.organizationId) {
-      const error = new Error('Device organization does not match the facility.')
-      error.statusCode = 403
-      throw error
-    }
-
-    const io = getIO()
-    const slotEntries = Object.entries(slots)
-    let slotsUpdated = 0
-    let observationsStored = 0
-    let staleOrConflicting = 0
-
-    for (const [slotCode, value] of slotEntries) {
-      const mappedStatus = STATUS_MAP[String(value).toLowerCase()]
-      if (!mappedStatus) continue
-
-      const targetSlot = await prisma.parkingSlot.findFirst({
-        where: {
-          slotCode,
-          zone: { facilityId }
-        },
-        include: {
-          zone: { select: { name: true, facilityId: true } }
+      for (const [slotCode, value] of Object.entries(slots)) {
+        const mappedStatus = STATUS_MAP[String(value).toLowerCase()]
+        if (!mappedStatus) continue
+        const targetSlot = await tx.parkingSlot.findFirst({ where: { slotCode, zone: { facilityId } } })
+        if (!targetSlot) continue
+        const latestEvidence = await tx.bayObservation.findFirst({
+          where: { facilityId, slotId: targetSlot.id },
+          orderBy: { observedAt: 'desc' },
+          select: { observedAt: true }
+        })
+        if (!isObservationCurrent(targetSlot, observedAt) || (latestEvidence && latestEvidence.observedAt >= observedAt)) staleOrConflicting += 1
+        try {
+          await tx.bayObservation.create({
+            data: {
+              organizationId: sourceDevice.facility.organizationId,
+              facilityId,
+              slotId: targetSlot.id,
+              deviceId: sourceDevice.id,
+              source: 'DEVICE_REPORT',
+              sourceReference: sourceDevice.id,
+              deduplicationKey: `device-report:${sourceDevice.id}:${targetSlot.id}:${observedAt.toISOString()}`,
+              result: mappedStatus === 'OCCUPIED' ? 'OCCUPIED' : 'VACANT',
+              confidence: req.body.confidence,
+              observedAt,
+              freshnessSeconds: Math.max(0, Math.round((Date.now() - observedAt.getTime()) / 1000))
+            }
+          })
+          observationsStored += 1
+        } catch (error) {
+          if (error.code !== 'P2002') throw error
+          staleOrConflicting += 1
         }
-      })
-      if (!targetSlot) continue
+      }
 
-      const latestEvidence = await prisma.bayObservation.findFirst({
-        where: { facilityId, slotId: targetSlot.id },
-        orderBy: { observedAt: 'desc' },
-        select: { observedAt: true }
-      })
-      const newerThanSlot = isObservationCurrent(targetSlot, observedAt)
-      const newerThanEvidence = !latestEvidence || latestEvidence.observedAt < observedAt
-      if (!newerThanSlot || !newerThanEvidence) staleOrConflicting += 1
-
-      try {
-        await prisma.bayObservation.create({
+      if (deviceHealth) {
+        await tx.device.updateMany({
+          where: { id: sourceDevice.id, lastPingAt: { lt: observedAt } },
           data: {
-            organizationId: assignedFacility.organizationId,
-            facilityId,
-            slotId: targetSlot.id,
-            deviceId: sourceDevice.id,
-            source: 'DEVICE_REPORT',
-            sourceReference: deviceId,
-            deduplicationKey: `device-report:${sourceDevice.id}:${targetSlot.id}:${observedAt.toISOString()}`,
-            result: mappedStatus === 'OCCUPIED' ? 'OCCUPIED' : 'VACANT',
-            confidence: req.body.confidence,
-            observedAt,
-            freshnessSeconds: Math.max(0, Math.round((Date.now() - observedAt.getTime()) / 1000))
+            cpuPercent: deviceHealth.cpuPercent ?? undefined,
+            ramPercent: deviceHealth.ramPercent ?? undefined,
+            temperature: deviceHealth.temperature ?? undefined,
+            ipAddress: deviceHealth.ipAddress ?? undefined,
+            status: 'ONLINE',
+            lastPingAt: observedAt
           }
         })
-        observationsStored += 1
-      } catch (error) {
-        if (error.code !== 'P2002') throw error
-        staleOrConflicting += 1
       }
-    }
+      return { processed: true, slotsUpdated: 0, slotsObserved: observationsStored, staleOrConflicting }
+    }, { isolationLevel: 'Serializable' })
 
-    if (deviceHealth) {
-      const device = await prisma.device.findUnique({ where: { id: sourceDevice.id } })
-      await prisma.device.updateMany({
-        where: { id: sourceDevice.id, lastPingAt: { lt: observedAt } },
-        data: {
-          cpuPercent: deviceHealth.cpuPercent ?? device.cpuPercent,
-          ramPercent: deviceHealth.ramPercent ?? device.ramPercent,
-          temperature: deviceHealth.temperature ?? device.temperature,
-          ipAddress: deviceHealth.ipAddress ?? device.ipAddress,
-          status: 'ONLINE',
-          lastPingAt: observedAt
-        }
-      })
-    }
-
-    await emitLiveSummary(facilityId, slotsUpdated)
-
+    await emitLiveSummary(facilityId, result.slotsUpdated)
     res.json({
       success: true,
-      data: {
-        processed: true,
-        slotsUpdated,
-        slotsObserved: observationsStored,
-        staleOrConflicting
-      }
+      data: result
     })
   } catch (error) {
+    if (error.code === 'P2002' || error.code === 'P2034') {
+      return res.status(409).json({ success: false, error: 'Duplicate device request.', code: 409 })
+    }
     next(error)
   }
 })

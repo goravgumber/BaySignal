@@ -8,7 +8,10 @@ export function createConfig(env = process.env) {
     frontendUrl: env.FRONTEND_URL || (env.NODE_ENV === 'production' ? '' : 'http://localhost:3000'),
     mqttUrl: env.MQTT_URL || 'mqtt://localhost:1883',
     trustProxy: env.TRUST_PROXY === 'true',
-    deviceApiKey: env.DEVICE_API_KEY || '',
+    allowLegacyDeviceApiKey: env.ALLOW_LEGACY_DEVICE_API_KEY === 'true',
+    legacyDeviceApiKey: env.LEGACY_DEVICE_API_KEY || '',
+    legacyDeviceApiKeyExpiresAt: env.LEGACY_DEVICE_API_KEY_EXPIRES_AT || '',
+    deviceRequestWindowSeconds: Number(env.DEVICE_REQUEST_WINDOW_SECONDS) || 300,
     allowSimulation: env.ALLOW_SIMULATION === 'true',
     rateLimitWindowMs: Number(env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
     rateLimitMax: Number(env.RATE_LIMIT_MAX) || 300,
@@ -33,8 +36,15 @@ export function validateRuntimeConfig(runtimeConfig) {
     if (frontendOrigin.protocol !== 'https:' || frontendOrigin.origin !== runtimeConfig.frontendUrl) {
       throw new Error('FRONTEND_URL must be a valid HTTPS origin in production.')
     }
-    if (!runtimeConfig.deviceApiKey || runtimeConfig.deviceApiKey.length < 32) {
-      throw new Error('DEVICE_API_KEY must be configured with at least 32 characters in production.')
+    if (runtimeConfig.allowLegacyDeviceApiKey) {
+      const expiresAt = Date.parse(runtimeConfig.legacyDeviceApiKeyExpiresAt)
+      const remainingMs = expiresAt - Date.now()
+      if (!runtimeConfig.legacyDeviceApiKey || runtimeConfig.legacyDeviceApiKey.length < 32 || !Number.isFinite(expiresAt) || remainingMs <= 0 || remainingMs > 30 * 24 * 60 * 60 * 1000) {
+        throw new Error('Legacy device authentication requires a strong key and an explicit cutoff within 30 days.')
+      }
+    }
+    if (runtimeConfig.deviceRequestWindowSeconds !== 300) {
+      throw new Error('DEVICE_REQUEST_WINDOW_SECONDS is fixed at 300 seconds.')
     }
   }
   return runtimeConfig
