@@ -36,7 +36,7 @@ No password, signing key, token, or production environment was accessed or rotat
 ## Reviewed controls
 
 - HTTP routes use JWT authentication and facility/organization access checks; tenant route tests cover foreign facilities, visits, reservations, public booking, and finance-field exclusion.
-- Socket connections require JWTs and facility-room joins check current database access. The PostgreSQL test suite does not currently exercise the Socket.IO handshake or room-join path; add that coverage before treating socket authorization as integration-verified.
+- Socket connections require JWTs and facility-room joins check current database access. The PostgreSQL 16 integration suite now tests invalid-token rejection, an authorized manager joining a facility room, and a foreign-tenant manager being denied.
 - Device keys are compared with `timingSafeEqual`, and production startup rejects a missing key. This does not remove the shared-key limitation above.
 - Express JSON request bodies are capped at 50 KB. Reservation pagination is capped at 100 rows; operations lists are capped at 100.
 - CORS uses the configured frontend origin; production configuration requires a valid HTTPS origin. The Socket.IO wildcard fallback is reachable only if frontend configuration is empty, which production validation rejects.
