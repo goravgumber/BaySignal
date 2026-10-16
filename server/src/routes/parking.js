@@ -1,21 +1,13 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { prisma } from '../db.js'
-import { authMiddleware, requireRoles } from '../middleware/auth.js'
-import { getIO } from '../socket.js'
+import { authMiddleware } from '../middleware/auth.js'
 import { validateBody, validateQuery } from '../middleware/validate.js'
+import { getBayDisplayStatus, summarizeBayRecords } from '../reconcileBayState.js'
+import { accessibleFacilityIds, hasFacilityAccess } from '../tenantAccess.js'
 
 const router = Router()
 
-const summaryCache = new Map()
-const SUMMARY_TTL_MS = 30 * 1000
-const VALID_SLOT_STATUSES = ['AVAILABLE', 'OCCUPIED', 'RESERVED', 'DISABLED']
-const ALLOWED_SLOT_TRANSITIONS = {
-  AVAILABLE: ['RESERVED', 'OCCUPIED', 'DISABLED'],
-  RESERVED: ['AVAILABLE', 'OCCUPIED', 'DISABLED'],
-  OCCUPIED: ['AVAILABLE', 'DISABLED'],
-  DISABLED: ['AVAILABLE']
-}
 const slotStatusSchema = z.object({
   status: z.enum(['AVAILABLE', 'OCCUPIED', 'RESERVED', 'DISABLED'])
 })
@@ -25,29 +17,29 @@ const slotFilterSchema = z.object({
 })
 
 function buildFacilitySummaryFromSlots(slots) {
-  const total = slots.length
-  const available = slots.filter((slot) => slot.status === 'AVAILABLE').length
-  const occupied = slots.filter((slot) => slot.status === 'OCCUPIED').length
-  const reserved = slots.filter((slot) => slot.status === 'RESERVED').length
-
-  return {
-    total,
-    available,
-    occupied,
-    reserved,
-    occupancyRate: total ? Number(((occupied / total) * 100).toFixed(2)) : 0,
-    lastUpdated: new Date().toISOString()
-  }
+  return { ...summarizeBayRecords(slots), lastUpdated: new Date().toISOString() }
 }
 
-router.get('/facilities', async (req, res, next) => {
+router.get('/facilities', authMiddleware, async (req, res, next) => {
   try {
+    const facilityIds = await accessibleFacilityIds(prisma, req.user, 'operations_read')
     const facilities = await prisma.facility.findMany({
+      where: { id: { in: facilityIds } },
       include: {
         zones: {
           include: {
             slots: {
-              select: { status: true }
+              select: {
+                status: true,
+                reservations: {
+                  where: {
+                    status: { in: ['UPCOMING', 'ACTIVE'] },
+                    startTime: { lte: new Date() },
+                    endTime: { gt: new Date() }
+                  },
+                  select: { id: true }
+                }
+              }
             }
           }
         }
@@ -56,7 +48,10 @@ router.get('/facilities', async (req, res, next) => {
     })
 
     const data = facilities.map((facility) => {
-      const slots = facility.zones.flatMap((zone) => zone.slots)
+      const slots = facility.zones.flatMap((zone) => zone.slots.map((slot) => ({
+        status: slot.status,
+        reservationHold: slot.reservations.length > 0
+      })))
       const summary = buildFacilitySummaryFromSlots(slots)
 
       return {
@@ -77,8 +72,13 @@ router.get('/facilities', async (req, res, next) => {
   }
 })
 
-router.get('/facilities/:id', async (req, res, next) => {
+router.get('/facilities/:id', authMiddleware, async (req, res, next) => {
   try {
+    if (!(await hasFacilityAccess(prisma, req.user, req.params.id, 'operations_read'))) {
+      const error = new Error('Facility not found.')
+      error.statusCode = 404
+      throw error
+    }
     const facility = await prisma.facility.findUnique({
       where: { id: req.params.id },
       include: {
@@ -88,7 +88,15 @@ router.get('/facilities/:id', async (req, res, next) => {
               select: {
                 id: true,
                 status: true,
-                slotType: true
+                slotType: true,
+                reservations: {
+                  where: {
+                    status: { in: ['UPCOMING', 'ACTIVE'] },
+                    startTime: { lte: new Date() },
+                    endTime: { gt: new Date() }
+                  },
+                  select: { id: true }
+                }
               }
             }
           },
@@ -104,11 +112,7 @@ router.get('/facilities/:id', async (req, res, next) => {
     }
 
     const zones = facility.zones.map((zone) => {
-      const total = zone.slots.length
-      const available = zone.slots.filter((slot) => slot.status === 'AVAILABLE').length
-      const occupied = zone.slots.filter((slot) => slot.status === 'OCCUPIED').length
-      const reserved = zone.slots.filter((slot) => slot.status === 'RESERVED').length
-      const disabled = zone.slots.filter((slot) => slot.status === 'DISABLED').length
+      const summary = summarizeBayRecords(zone.slots.map((slot) => ({ status: slot.status, reservationHold: slot.reservations.length > 0 })))
 
       return {
         id: zone.id,
@@ -116,11 +120,7 @@ router.get('/facilities/:id', async (req, res, next) => {
         code: zone.code,
         capacity: zone.capacity,
         ratePerHour: zone.ratePerHour,
-        total,
-        available,
-        occupied,
-        reserved,
-        disabled
+        ...summary
       }
     })
 
@@ -142,10 +142,15 @@ router.get('/facilities/:id', async (req, res, next) => {
   }
 })
 
-router.get('/facilities/:id/slots', validateQuery(slotFilterSchema), async (req, res, next) => {
+router.get('/facilities/:id/slots', authMiddleware, validateQuery(slotFilterSchema), async (req, res, next) => {
   try {
     const { zone, status } = req.query
     const facilityId = req.params.id
+    if (!(await hasFacilityAccess(prisma, req.user, facilityId, 'operations_read'))) {
+      const error = new Error('Facility not found.')
+      error.statusCode = 404
+      throw error
+    }
 
     const where = {
       zone: {
@@ -180,18 +185,32 @@ router.get('/facilities/:id/slots', validateQuery(slotFilterSchema), async (req,
               }
             }
           }
+        },
+        reservations: {
+          where: {
+            status: { in: ['UPCOMING', 'ACTIVE'] },
+            startTime: { lte: new Date() },
+            endTime: { gt: new Date() }
+          },
+          select: { id: true }
         }
       },
       orderBy: { slotCode: 'asc' }
     })
 
-    res.json({ success: true, data: slots })
+    res.json({
+      success: true,
+      data: slots.map(({ reservations, ...slot }) => {
+        const reservationHold = reservations.length > 0
+        return { ...slot, reservationHold, displayStatus: getBayDisplayStatus(slot.status, reservationHold) }
+      })
+    })
   } catch (error) {
     next(error)
   }
 })
 
-router.get('/slots/:id', async (req, res, next) => {
+router.get('/slots/:id', authMiddleware, async (req, res, next) => {
   try {
     const slot = await prisma.parkingSlot.findUnique({
       where: { id: req.params.id },
@@ -210,95 +229,45 @@ router.get('/slots/:id', async (req, res, next) => {
       throw error
     }
 
+    if (!(await hasFacilityAccess(prisma, req.user, slot.zone.facilityId, 'operations_read'))) {
+      const error = new Error('Parking slot not found.')
+      error.statusCode = 404
+      throw error
+    }
+
     res.json({ success: true, data: slot })
   } catch (error) {
     next(error)
   }
 })
 
-router.put('/slots/:id/status', authMiddleware, requireRoles('OWNER', 'ADMIN'), validateBody(slotStatusSchema), async (req, res, next) => {
+router.put('/slots/:id/status', authMiddleware, validateBody(slotStatusSchema), async (req, res, next) => {
   try {
-    const { status } = req.body
-    const normalizedStatus = String(status || '').toUpperCase()
-
-    if (!VALID_SLOT_STATUSES.includes(normalizedStatus)) {
-      const error = new Error('Invalid slot status provided.')
-      error.statusCode = 400
-      throw error
-    }
-
-    const existingSlot = await prisma.parkingSlot.findUnique({
+    const slot = await prisma.parkingSlot.findUnique({
       where: { id: req.params.id },
-      include: {
-        zone: {
-          include: {
-            facility: true
-          }
-        }
-      }
+      include: { zone: { select: { facilityId: true } } }
     })
-    if (!existingSlot) {
-      const error = new Error('Parking slot not found.')
-      error.statusCode = 404
-      throw error
+    if (!slot || !(await hasFacilityAccess(prisma, req.user, slot.zone.facilityId, 'correction_write'))) {
+      return res.status(404).json({ success: false, error: 'Parking slot not found.', code: 404 })
     }
-    const allowedNext = ALLOWED_SLOT_TRANSITIONS[existingSlot.status] || []
-    if (!allowedNext.includes(normalizedStatus)) {
-      const error = new Error(`Invalid slot transition from ${existingSlot.status} to ${normalizedStatus}.`)
-      error.statusCode = 409
-      throw error
-    }
-
-    const updatedSlot = await prisma.parkingSlot.update({
-      where: { id: req.params.id },
-      data: { status: normalizedStatus },
-      include: {
-        zone: {
-          include: {
-            facility: true
-          }
-        }
-      }
+    return res.status(501).json({
+      success: false,
+      error: 'Manual bay corrections must be submitted through a discrepancy resolution with a reason and audit record.',
+      code: 501
     })
-
-    const payload = {
-      slotId: updatedSlot.id,
-      status: updatedSlot.status,
-      slotCode: updatedSlot.slotCode,
-      zone: updatedSlot.zone.name,
-      facilityId: updatedSlot.zone.facilityId
-    }
-
-    const io = getIO()
-    if (io) {
-      io.to(updatedSlot.zone.facilityId).emit('slot:updated', payload)
-    }
-
-    summaryCache.delete(updatedSlot.zone.facilityId)
-
-    res.json({ success: true, data: updatedSlot })
   } catch (error) {
-    if (error.code === 'P2025') {
-      error.statusCode = 404
-      error.message = 'Parking slot not found.'
-    }
-    next(error)
+    return next(error)
   }
 })
 
-router.get('/summary/:facilityId', async (req, res, next) => {
+router.get('/summary/:facilityId', authMiddleware, async (req, res, next) => {
   try {
     const { facilityId } = req.params
-    const now = Date.now()
-    const cached = summaryCache.get(facilityId)
-
-    if (cached && now - cached.timestamp < SUMMARY_TTL_MS) {
-      return res.json({
-        success: true,
-        data: cached.data
-      })
+    if (!(await hasFacilityAccess(prisma, req.user, facilityId, 'operations_read'))) {
+      const error = new Error('Facility not found.')
+      error.statusCode = 404
+      throw error
     }
-
     const slots = await prisma.parkingSlot.findMany({
       where: {
         zone: {
@@ -306,7 +275,15 @@ router.get('/summary/:facilityId', async (req, res, next) => {
         }
       },
       select: {
-        status: true
+        status: true,
+        reservations: {
+          where: {
+            status: { in: ['UPCOMING', 'ACTIVE'] },
+            startTime: { lte: new Date() },
+            endTime: { gt: new Date() }
+          },
+          select: { id: true }
+        }
       }
     })
 
@@ -319,12 +296,7 @@ router.get('/summary/:facilityId', async (req, res, next) => {
       }
     }
 
-    const data = buildFacilitySummaryFromSlots(slots)
-    summaryCache.set(facilityId, {
-      data,
-      timestamp: now
-    })
-
+    const data = buildFacilitySummaryFromSlots(slots.map((slot) => ({ status: slot.status, reservationHold: slot.reservations.length > 0 })))
     res.json({ success: true, data })
   } catch (error) {
     next(error)

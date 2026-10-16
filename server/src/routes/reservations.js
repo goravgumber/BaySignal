@@ -3,9 +3,9 @@ import crypto from 'crypto'
 import { Prisma } from '@prisma/client'
 import { z } from 'zod'
 import { prisma } from '../db.js'
-import { authMiddleware, requireRoles } from '../middleware/auth.js'
-import { getIO } from '../socket.js'
+import { authMiddleware } from '../middleware/auth.js'
 import { validateBody, validateQuery } from '../middleware/validate.js'
+import { accessibleFacilityIds, hasFacilityAccess } from '../tenantAccess.js'
 
 const router = Router()
 
@@ -43,16 +43,19 @@ function calculatePricing(ratePerHour, durationHours) {
   return { baseAmount, serviceFee, gst, totalAmount }
 }
 
-async function emitSlotUpdated(slot) {
-  const io = getIO()
-  if (!io) return
-
-  io.to(slot.zone.facilityId).emit('slot:updated', {
-    slotId: slot.id,
-    status: slot.status,
-    slotCode: slot.slotCode,
-    zone: slot.zone.name,
-    facilityId: slot.zone.facilityId
+async function recordReservationAudit(tx, { actorUserId, facilityId, reservationId, action, beforeStatus, afterStatus }) {
+  const facility = await tx.facility.findUnique({ where: { id: facilityId }, select: { organizationId: true } })
+  await tx.auditEvent.create({
+    data: {
+      organizationId: facility?.organizationId,
+      facilityId,
+      actorUserId,
+      action,
+      resourceType: 'Reservation',
+      resourceId: reservationId,
+      beforeState: beforeStatus ? { status: beforeStatus } : undefined,
+      afterState: { status: afterStatus }
+    }
   })
 }
 
@@ -92,6 +95,14 @@ router.post('/', authMiddleware, validateBody(createReservationSchema), async (r
               throw error
             }
 
+            const facilityId = slot.zone.facility.id
+            const permitted = await hasFacilityAccess(tx, req.user, facilityId, 'reservations_write')
+            if (!permitted && !(req.user.role === 'DRIVER' && slot.zone.facility.allowPublicReservations)) {
+              const error = new Error('Facility not found.')
+              error.statusCode = 404
+              throw error
+            }
+
             if (slot.status !== 'AVAILABLE') {
               const error = new Error('Slot is not available for booking.')
               error.statusCode = 409
@@ -112,19 +123,19 @@ router.post('/', authMiddleware, validateBody(createReservationSchema), async (r
               throw error
             }
 
-            const lockUpdate = await tx.parkingSlot.updateMany({
-              where: { id: slotId, status: 'AVAILABLE' },
-              data: { status: 'RESERVED' }
+            const availabilityLock = await tx.parkingSlot.updateMany({
+              where: { id: slotId, status: 'AVAILABLE', updatedAt: slot.updatedAt },
+              data: { status: 'AVAILABLE' }
             })
-            if (lockUpdate.count !== 1) {
-              const error = new Error('Slot was reserved by another request. Please retry.')
+            if (availabilityLock.count !== 1) {
+              const error = new Error('Bay state changed while creating the reservation. Please refresh and retry.')
               error.statusCode = 409
               throw error
             }
 
             pricing = calculatePricing(slot.zone.ratePerHour, duration)
             const reservationCode = generateReservationCode()
-            return tx.reservation.create({
+            const reservation = await tx.reservation.create({
               data: {
                 reservationCode,
                 slotId,
@@ -151,6 +162,14 @@ router.post('/', authMiddleware, validateBody(createReservationSchema), async (r
                 }
               }
             })
+            await recordReservationAudit(tx, {
+              actorUserId: req.user.id,
+              facilityId,
+              reservationId: reservation.id,
+              action: 'RESERVATION_CREATED',
+              afterStatus: reservation.status
+            })
+            return reservation
           },
           { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
         )
@@ -166,13 +185,6 @@ router.post('/', authMiddleware, validateBody(createReservationSchema), async (r
       error.statusCode = 500
       throw error
     }
-
-    await emitSlotUpdated({
-      id: createdReservation.slot.id,
-      status: 'RESERVED',
-      slotCode: createdReservation.slot.slotCode,
-      zone: createdReservation.slot.zone
-    })
 
     res.status(201).json({
       success: true,
@@ -195,9 +207,14 @@ router.get('/', authMiddleware, validateQuery(reservationQuerySchema), async (re
     const limit = Math.min(Math.max(Number(req.query.limit) || 10, 1), 100)
     const skip = (page - 1) * limit
 
+    const accessibleIds = req.user.role === 'DRIVER'
+      ? []
+      : await accessibleFacilityIds(prisma, req.user, 'reservations_read')
     const where = {
       ...(status ? { status } : {}),
-      ...(req.user.role === 'DRIVER' ? { userId: req.user.id } : {})
+      ...(req.user.role === 'DRIVER'
+        ? { userId: req.user.id }
+        : { slot: { zone: { facilityId: { in: accessibleIds } } } })
     }
 
     const [data, total] = await prisma.$transaction([
@@ -274,7 +291,10 @@ router.get('/:id', authMiddleware, async (req, res, next) => {
       throw error
     }
 
-    if (req.user.role === 'DRIVER' && reservation.userId !== req.user.id) {
+    const authorized = req.user.role === 'DRIVER'
+      ? reservation.userId === req.user.id
+      : await hasFacilityAccess(prisma, req.user, reservation.slot.zone.facilityId, 'reservations_read')
+    if (!authorized) {
       const error = new Error('You are not allowed to view this reservation.')
       error.statusCode = 403
       throw error
@@ -305,7 +325,10 @@ router.put('/:id/cancel', authMiddleware, async (req, res, next) => {
       throw error
     }
 
-    if (req.user.role === 'DRIVER' && existing.userId !== req.user.id) {
+    const authorized = req.user.role === 'DRIVER'
+      ? existing.userId === req.user.id
+      : await hasFacilityAccess(prisma, req.user, existing.slot.zone.facilityId, 'reservations_write')
+    if (!authorized) {
       const error = new Error('You are not allowed to cancel this reservation.')
       error.statusCode = 403
       throw error
@@ -318,33 +341,28 @@ router.put('/:id/cancel', authMiddleware, async (req, res, next) => {
     }
 
     const updated = await prisma.$transaction(async (tx) => {
-      const reservation = await tx.reservation.update({
-        where: { id: req.params.id },
-        data: { status: 'CANCELLED' },
-        include: {
-          slot: {
-            include: {
-              zone: {
-                include: { facility: true }
-              }
-            }
-          }
-        }
+      const changed = await tx.reservation.updateMany({
+        where: { id: existing.id, status: 'UPCOMING' },
+        data: { status: 'CANCELLED' }
       })
-
-      await tx.parkingSlot.update({
-        where: { id: reservation.slotId },
-        data: { status: 'AVAILABLE' }
+      if (changed.count !== 1) {
+        const error = new Error('Reservation changed while cancellation was being processed.')
+        error.statusCode = 409
+        throw error
+      }
+      const reservation = await tx.reservation.findUnique({
+        where: { id: existing.id },
+        include: { slot: { include: { zone: { include: { facility: true } } } } }
       })
-
+      await recordReservationAudit(tx, {
+        actorUserId: req.user.id,
+        facilityId: existing.slot.zone.facilityId,
+        reservationId: existing.id,
+        action: 'RESERVATION_CANCELLED',
+        beforeStatus: 'UPCOMING',
+        afterStatus: 'CANCELLED'
+      })
       return reservation
-    })
-
-    await emitSlotUpdated({
-      id: updated.slot.id,
-      status: 'AVAILABLE',
-      slotCode: updated.slot.slotCode,
-      zone: updated.slot.zone
     })
 
     res.json({ success: true, data: updated })
@@ -353,10 +371,18 @@ router.put('/:id/cancel', authMiddleware, async (req, res, next) => {
   }
 })
 
-router.post('/:id/checkin', authMiddleware, requireRoles('OWNER', 'ADMIN'), async (req, res, next) => {
+router.post('/:id/checkin', authMiddleware, async (req, res, next) => {
   try {
-    const reservation = await prisma.reservation.findUnique({ where: { id: req.params.id } })
+    const reservation = await prisma.reservation.findUnique({
+      where: { id: req.params.id },
+      include: { slot: { include: { zone: { select: { facilityId: true } } } } }
+    })
     if (!reservation) {
+      const error = new Error('Reservation not found.')
+      error.statusCode = 404
+      throw error
+    }
+    if (!(await hasFacilityAccess(prisma, req.user, reservation.slot.zone.facilityId, 'reservation_checkin'))) {
       const error = new Error('Reservation not found.')
       error.statusCode = 404
       throw error
@@ -368,35 +394,28 @@ router.post('/:id/checkin', authMiddleware, requireRoles('OWNER', 'ADMIN'), asyn
     }
 
     const updated = await prisma.$transaction(async (tx) => {
-      const updatedReservation = await tx.reservation.update({
-        where: { id: req.params.id },
-        data: { status: 'ACTIVE' },
-        include: {
-          slot: {
-            include: {
-              zone: {
-                include: {
-                  facility: true
-                }
-              }
-            }
-          }
-        }
+      const changed = await tx.reservation.updateMany({
+        where: { id: reservation.id, status: { in: ['UPCOMING', 'ACTIVE'] } },
+        data: { status: 'ACTIVE' }
       })
-
-      await tx.parkingSlot.update({
-        where: { id: updatedReservation.slotId },
-        data: { status: 'OCCUPIED' }
+      if (changed.count !== 1) {
+        const error = new Error('Reservation changed while check-in was being processed.')
+        error.statusCode = 409
+        throw error
+      }
+      const record = await tx.reservation.findUnique({
+        where: { id: reservation.id },
+        include: { slot: { include: { zone: { include: { facility: true } } } } }
       })
-
-      return updatedReservation
-    })
-
-    await emitSlotUpdated({
-      id: updated.slot.id,
-      status: 'OCCUPIED',
-      slotCode: updated.slot.slotCode,
-      zone: updated.slot.zone
+      await recordReservationAudit(tx, {
+        actorUserId: req.user.id,
+        facilityId: reservation.slot.zone.facilityId,
+        reservationId: reservation.id,
+        action: 'RESERVATION_CHECKED_IN',
+        beforeStatus: reservation.status,
+        afterStatus: 'ACTIVE'
+      })
+      return record
     })
 
     res.json({ success: true, data: updated })
@@ -405,10 +424,18 @@ router.post('/:id/checkin', authMiddleware, requireRoles('OWNER', 'ADMIN'), asyn
   }
 })
 
-router.post('/:id/checkout', authMiddleware, requireRoles('OWNER', 'ADMIN'), async (req, res, next) => {
+router.post('/:id/checkout', authMiddleware, async (req, res, next) => {
   try {
-    const reservation = await prisma.reservation.findUnique({ where: { id: req.params.id } })
+    const reservation = await prisma.reservation.findUnique({
+      where: { id: req.params.id },
+      include: { slot: { include: { zone: { select: { facilityId: true } } } } }
+    })
     if (!reservation) {
+      const error = new Error('Reservation not found.')
+      error.statusCode = 404
+      throw error
+    }
+    if (!(await hasFacilityAccess(prisma, req.user, reservation.slot.zone.facilityId, 'reservation_checkin'))) {
       const error = new Error('Reservation not found.')
       error.statusCode = 404
       throw error
@@ -420,35 +447,28 @@ router.post('/:id/checkout', authMiddleware, requireRoles('OWNER', 'ADMIN'), asy
     }
 
     const updated = await prisma.$transaction(async (tx) => {
-      const updatedReservation = await tx.reservation.update({
-        where: { id: req.params.id },
-        data: { status: 'COMPLETED' },
-        include: {
-          slot: {
-            include: {
-              zone: {
-                include: {
-                  facility: true
-                }
-              }
-            }
-          }
-        }
+      const changed = await tx.reservation.updateMany({
+        where: { id: reservation.id, status: 'ACTIVE' },
+        data: { status: 'COMPLETED' }
       })
-
-      await tx.parkingSlot.update({
-        where: { id: updatedReservation.slotId },
-        data: { status: 'AVAILABLE' }
+      if (changed.count !== 1) {
+        const error = new Error('Reservation changed while checkout was being processed.')
+        error.statusCode = 409
+        throw error
+      }
+      const record = await tx.reservation.findUnique({
+        where: { id: reservation.id },
+        include: { slot: { include: { zone: { include: { facility: true } } } } }
       })
-
-      return updatedReservation
-    })
-
-    await emitSlotUpdated({
-      id: updated.slot.id,
-      status: 'AVAILABLE',
-      slotCode: updated.slot.slotCode,
-      zone: updated.slot.zone
+      await recordReservationAudit(tx, {
+        actorUserId: req.user.id,
+        facilityId: reservation.slot.zone.facilityId,
+        reservationId: reservation.id,
+        action: 'RESERVATION_CHECKED_OUT',
+        beforeStatus: 'ACTIVE',
+        afterStatus: 'COMPLETED'
+      })
+      return record
     })
 
     res.json({ success: true, data: updated })

@@ -7,6 +7,7 @@ import { config } from '../config.js'
 import { authMiddleware } from '../middleware/auth.js'
 import { validateBody } from '../middleware/validate.js'
 import { authRateLimit } from '../middleware/rateLimiter.js'
+import { userAccessSummary } from '../tenantAccess.js'
 
 const router = Router()
 
@@ -64,11 +65,12 @@ router.post('/register', authRateLimit, validateBody(registerSchema), async (req
     })
 
     const token = makeToken(user)
+    const userWithAccess = { ...user, ...(await userAccessSummary(prisma, user)) }
     res.status(201).json({
       success: true,
       data: {
         token,
-        user
+        user: userWithAccess
       }
     })
   } catch (error) {
@@ -104,6 +106,7 @@ router.post('/login', authRateLimit, validateBody(loginSchema), async (req, res,
       role: user.role,
       createdAt: user.createdAt
     }
+    Object.assign(safeUser, await userAccessSummary(prisma, safeUser))
 
     const token = makeToken(user)
     res.json({
@@ -137,9 +140,10 @@ router.get('/me', authMiddleware, async (req, res, next) => {
       throw error
     }
 
+    const userWithAccess = { ...user, ...(await userAccessSummary(prisma, user)) }
     res.json({
       success: true,
-      data: user
+      data: userWithAccess
     })
   } catch (error) {
     next(error)

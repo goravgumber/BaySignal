@@ -35,7 +35,7 @@ export default function ReservationsPage() {
   const [toasts, setToasts] = useState([])
   const [actionLoadingId, setActionLoadingId] = useState('')
 
-  const canManage = ['OWNER', 'ADMIN'].includes(user?.role)
+  const canManage = user?.permissions?.includes('reservation_checkin')
 
   const addToast = useCallback((toast) => {
     setToasts((prev) => [...prev, { ...toast, id: crypto.randomUUID() }])

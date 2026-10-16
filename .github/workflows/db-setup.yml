@@ -1,13 +1,28 @@
-name: Database Setup
+name: Controlled Database Migration
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type APPLY-MIGRATIONS to confirm a reviewed migration run
+        required: true
+        type: string
+      database_kind:
+        description: Choose only after inspecting the target database schema
+        required: true
+        type: choice
+        options:
+          - fresh-empty-database
+          - existing-schema-compared
+      baseline_confirmation:
+        description: Type FRESH-EMPTY or BASELINE-MATCHED according to database_kind
+        required: true
+        type: string
 
 jobs:
-  setup-db:
+  migrate:
     runs-on: ubuntu-latest
+    if: ${{ inputs.confirm == 'APPLY-MIGRATIONS' }}
 
     steps:
       - name: Checkout repo
@@ -16,20 +31,50 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 20
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
         working-directory: ./server
 
-      - name: Run Prisma DB Push
-        run: npx prisma db push
+      - name: Require versioned migrations
+        run: |
+          if [ ! -d prisma/migrations ] || [ -z "$(find prisma/migrations -mindepth 1 -maxdepth 1 -type d -print -quit)" ]; then
+            echo "No reviewed Prisma migrations are present; refusing to report a successful migration run."
+            exit 1
+          fi
+        working-directory: ./server
+
+      - name: Require database baseline confirmation
+        env:
+          DATABASE_KIND: ${{ inputs.database_kind }}
+          BASELINE_CONFIRMATION: ${{ inputs.baseline_confirmation }}
+        run: |
+          if [ "$DATABASE_KIND" = "fresh-empty-database" ] && [ "$BASELINE_CONFIRMATION" != "FRESH-EMPTY" ]; then
+            echo "Fresh databases require FRESH-EMPTY confirmation."
+            exit 1
+          fi
+          if [ "$DATABASE_KIND" = "existing-schema-compared" ] && [ "$BASELINE_CONFIRMATION" != "BASELINE-MATCHED" ]; then
+            echo "Existing databases require BASELINE-MATCHED after schema-only comparison."
+            exit 1
+          fi
+
+      - name: Verify existing database exactly matches the checked-in baseline
+        if: ${{ inputs.database_kind == 'existing-schema-compared' }}
+        run: npx prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel prisma/baseline-schema.prisma --exit-code
         working-directory: ./server
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
-      - name: Run Seed Script
-        run: node prisma/seed.js
+      - name: Adopt the reviewed baseline for an existing database
+        if: ${{ inputs.database_kind == 'existing-schema-compared' }}
+        run: npx prisma migrate resolve --applied 20261015100000_baseline
+        working-directory: ./server
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Apply versioned migrations
+        run: npx prisma migrate deploy
         working-directory: ./server
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}

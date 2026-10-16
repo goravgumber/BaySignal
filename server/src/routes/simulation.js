@@ -1,11 +1,23 @@
 import { Router } from 'express'
+import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { prisma } from '../db.js'
 import { authMiddleware } from '../middleware/auth.js'
+import { verifyDeviceIngestion } from '../middleware/deviceAuth.js'
+import { config } from '../config.js'
 import { validateBody } from '../middleware/validate.js'
 import { getIO } from '../socket.js'
+import { isObservationCurrent } from '../parkingObservations.js'
+import { hasFacilityAccess } from '../tenantAccess.js'
 
 const router = Router()
+
+function simulationAllowed(req, res, next) {
+  if (config.nodeEnv === 'production' && !config.allowSimulation) {
+    return res.status(404).json({ success: false, error: 'Simulation is disabled in production.', code: 404 })
+  }
+  return next()
+}
 
 const startSchema = z.object({
   facilityId: z.string().uuid(),
@@ -15,9 +27,9 @@ const startSchema = z.object({
 const piPayloadSchema = z.object({
   parking_id: z.string().min(1),
   device_id: z.string().min(1),
-  timestamp: z.string().min(1),
-  slots: z.record(z.string().regex(/^(available|occupied|reserved|disabled)$/i)),
-  confidence: z.number().min(0).max(1).optional().default(0.9),
+  timestamp: z.string().datetime({ offset: true }),
+  slots: z.record(z.string().regex(/^(available|occupied)$/i)),
+  confidence: z.number().min(0).max(1).optional(),
   device_health: z
     .object({
       cpuPercent: z.number().min(0).max(100).optional(),
@@ -88,10 +100,18 @@ async function simulationTick() {
   state.isTicking = true
 
   try {
+    const now = new Date()
     const candidates = await prisma.parkingSlot.findMany({
       where: {
         zone: { facilityId: state.facilityId },
-        status: { in: ['AVAILABLE', 'OCCUPIED'] }
+        status: { in: ['AVAILABLE', 'OCCUPIED'] },
+        reservations: {
+          none: {
+            status: { in: ['UPCOMING', 'ACTIVE'] },
+            startTime: { lte: now },
+            endTime: { gt: now }
+          }
+        }
       },
       select: {
         id: true,
@@ -100,7 +120,8 @@ async function simulationTick() {
         zone: {
           select: {
             name: true,
-            facilityId: true
+            facilityId: true,
+            facility: { select: { organizationId: true } }
           }
         }
       }
@@ -112,21 +133,50 @@ async function simulationTick() {
     const selected = pickRandom(candidates, count)
 
     const io = getIO()
-    await prisma.$transaction(
-      selected.map((slot) =>
-        prisma.parkingSlot.update({
-          where: { id: slot.id },
-          data: { status: slot.status === 'AVAILABLE' ? 'OCCUPIED' : 'AVAILABLE' }
+    const changedSlots = await prisma.$transaction(async (tx) => {
+      const changed = []
+      for (const slot of selected) {
+        const newStatus = slot.status === 'AVAILABLE' ? 'OCCUPIED' : 'AVAILABLE'
+        const updated = await tx.parkingSlot.updateMany({
+          where: { id: slot.id, status: slot.status },
+          data: { status: newStatus }
         })
-      )
-    )
+        if (updated.count !== 1) continue
+        const observation = await tx.bayObservation.create({
+          data: {
+            organizationId: slot.zone.facility.organizationId,
+            facilityId: slot.zone.facilityId,
+            slotId: slot.id,
+            source: 'SIMULATION',
+            sourceReference: 'application-simulator',
+            deduplicationKey: `simulation:${randomUUID()}`,
+            result: newStatus === 'OCCUPIED' ? 'OCCUPIED' : 'VACANT',
+            observedAt: now,
+            details: { simulation: true }
+          }
+        })
+        await tx.auditEvent.create({
+          data: {
+            organizationId: slot.zone.facility.organizationId,
+            facilityId: slot.zone.facilityId,
+            actorSystem: 'application-simulator',
+            action: 'SIMULATED_BAY_STATE_CHANGE',
+            resourceType: 'ParkingSlot',
+            resourceId: slot.id,
+            beforeState: { status: slot.status },
+            afterState: { status: newStatus, observationId: observation.id }
+          }
+        })
+        changed.push({ ...slot, newStatus })
+      }
+      return changed
+    })
 
     if (io) {
-      selected.forEach((slot) => {
-        const newStatus = slot.status === 'AVAILABLE' ? 'OCCUPIED' : 'AVAILABLE'
+      changedSlots.forEach((slot) => {
         io.to(state.facilityId).emit('slot:updated', {
           slotId: slot.id,
-          status: newStatus,
+          status: slot.newStatus,
           slotCode: slot.slotCode,
           zone: slot.zone.name,
           facilityId: slot.zone.facilityId
@@ -135,7 +185,7 @@ async function simulationTick() {
     }
 
     state.updatesCount += 1
-    await emitLiveSummary(state.facilityId, selected.length)
+    await emitLiveSummary(state.facilityId, changedSlots.length)
   } catch (error) {
     console.error('[simulationTick]', error)
   } finally {
@@ -155,9 +205,15 @@ function stopSimulationInterval() {
   state.isTicking = false
 }
 
-router.post('/start', authMiddleware, validateBody(startSchema), async (req, res, next) => {
+router.post('/start', simulationAllowed, authMiddleware, validateBody(startSchema), async (req, res, next) => {
   try {
     const { facilityId, intervalSeconds } = req.body
+
+    if (!(await hasFacilityAccess(prisma, req.user, facilityId, 'simulation_write'))) {
+      const error = new Error('Facility not found.')
+      error.statusCode = 404
+      throw error
+    }
 
     const facility = await prisma.facility.findUnique({ where: { id: facilityId }, select: { id: true } })
     if (!facility) {
@@ -192,9 +248,14 @@ router.post('/start', authMiddleware, validateBody(startSchema), async (req, res
   }
 })
 
-router.post('/stop', authMiddleware, async (req, res, next) => {
+router.post('/stop', simulationAllowed, authMiddleware, async (req, res, next) => {
   try {
     if (state.isRunning) {
+      if (!(await hasFacilityAccess(prisma, req.user, state.facilityId, 'simulation_write'))) {
+        const error = new Error('Simulation not found.')
+        error.statusCode = 404
+        throw error
+      }
       stopSimulationInterval()
     }
 
@@ -209,9 +270,10 @@ router.post('/stop', authMiddleware, async (req, res, next) => {
   }
 })
 
-router.post('/pi-payload', authMiddleware, validateBody(piPayloadSchema), async (req, res, next) => {
+router.post('/pi-payload', simulationAllowed, verifyDeviceIngestion, validateBody(piPayloadSchema), async (req, res, next) => {
   try {
     const { parking_id: facilityId, device_id: deviceId, slots, device_health: deviceHealth } = req.body
+    const observedAt = new Date(req.body.timestamp)
 
     const facility = await prisma.facility.findUnique({ where: { id: facilityId }, select: { id: true } })
     if (!facility) {
@@ -220,9 +282,33 @@ router.post('/pi-payload', authMiddleware, validateBody(piPayloadSchema), async 
       throw error
     }
 
+    const assignedFacility = await prisma.facility.findUnique({ where: { id: facilityId }, select: { organizationId: true } })
+    if (!assignedFacility?.organizationId) {
+      const error = new Error('Facility is not assigned to an organization.')
+      error.statusCode = 409
+      throw error
+    }
+
+    const sourceDevice = await prisma.device.findFirst({
+      where: { facilityId, OR: [{ id: deviceId }, { deviceCode: deviceId }] },
+      select: { id: true, facility: { select: { organizationId: true } } }
+    })
+    if (!sourceDevice) {
+      const error = new Error('Registered device not found for this facility.')
+      error.statusCode = 404
+      throw error
+    }
+    if (sourceDevice.facility.organizationId !== assignedFacility.organizationId) {
+      const error = new Error('Device organization does not match the facility.')
+      error.statusCode = 403
+      throw error
+    }
+
     const io = getIO()
     const slotEntries = Object.entries(slots)
     let slotsUpdated = 0
+    let observationsStored = 0
+    let staleOrConflicting = 0
 
     for (const [slotCode, value] of slotEntries) {
       const mappedStatus = STATUS_MAP[String(value).toLowerCase()]
@@ -239,47 +325,51 @@ router.post('/pi-payload', authMiddleware, validateBody(piPayloadSchema), async 
       })
       if (!targetSlot) continue
 
-      if (targetSlot.status !== mappedStatus) {
-        await prisma.parkingSlot.update({
-          where: { id: targetSlot.id },
-          data: { status: mappedStatus }
-        })
+      const latestEvidence = await prisma.bayObservation.findFirst({
+        where: { facilityId, slotId: targetSlot.id },
+        orderBy: { observedAt: 'desc' },
+        select: { observedAt: true }
+      })
+      const newerThanSlot = isObservationCurrent(targetSlot, observedAt)
+      const newerThanEvidence = !latestEvidence || latestEvidence.observedAt < observedAt
+      if (!newerThanSlot || !newerThanEvidence) staleOrConflicting += 1
 
-        if (io) {
-          io.to(facilityId).emit('slot:updated', {
+      try {
+        await prisma.bayObservation.create({
+          data: {
+            organizationId: assignedFacility.organizationId,
+            facilityId,
             slotId: targetSlot.id,
-            status: mappedStatus,
-            slotCode: targetSlot.slotCode,
-            zone: targetSlot.zone.name,
-            facilityId: targetSlot.zone.facilityId
-          })
-        }
-
-        slotsUpdated += 1
+            deviceId: sourceDevice.id,
+            source: 'DEVICE_REPORT',
+            sourceReference: deviceId,
+            deduplicationKey: `device-report:${sourceDevice.id}:${targetSlot.id}:${observedAt.toISOString()}`,
+            result: mappedStatus === 'OCCUPIED' ? 'OCCUPIED' : 'VACANT',
+            confidence: req.body.confidence,
+            observedAt,
+            freshnessSeconds: Math.max(0, Math.round((Date.now() - observedAt.getTime()) / 1000))
+          }
+        })
+        observationsStored += 1
+      } catch (error) {
+        if (error.code !== 'P2002') throw error
+        staleOrConflicting += 1
       }
     }
 
     if (deviceHealth) {
-      const device = await prisma.device.findFirst({
-        where: {
-          facilityId,
-          OR: [{ id: deviceId }, { deviceCode: deviceId }]
+      const device = await prisma.device.findUnique({ where: { id: sourceDevice.id } })
+      await prisma.device.updateMany({
+        where: { id: sourceDevice.id, lastPingAt: { lt: observedAt } },
+        data: {
+          cpuPercent: deviceHealth.cpuPercent ?? device.cpuPercent,
+          ramPercent: deviceHealth.ramPercent ?? device.ramPercent,
+          temperature: deviceHealth.temperature ?? device.temperature,
+          ipAddress: deviceHealth.ipAddress ?? device.ipAddress,
+          status: 'ONLINE',
+          lastPingAt: observedAt
         }
       })
-
-      if (device) {
-        await prisma.device.update({
-          where: { id: device.id },
-          data: {
-            cpuPercent: deviceHealth.cpuPercent ?? device.cpuPercent,
-            ramPercent: deviceHealth.ramPercent ?? device.ramPercent,
-            temperature: deviceHealth.temperature ?? device.temperature,
-            ipAddress: deviceHealth.ipAddress ?? device.ipAddress,
-            status: deviceHealth.status ?? device.status,
-            lastPingAt: new Date()
-          }
-        })
-      }
     }
 
     await emitLiveSummary(facilityId, slotsUpdated)
@@ -288,7 +378,9 @@ router.post('/pi-payload', authMiddleware, validateBody(piPayloadSchema), async 
       success: true,
       data: {
         processed: true,
-        slotsUpdated
+        slotsUpdated,
+        slotsObserved: observationsStored,
+        staleOrConflicting
       }
     })
   } catch (error) {
@@ -298,6 +390,9 @@ router.post('/pi-payload', authMiddleware, validateBody(piPayloadSchema), async 
 
 router.get('/status', authMiddleware, async (req, res, next) => {
   try {
+    if (state.facilityId && !(await hasFacilityAccess(prisma, req.user, state.facilityId, 'operations_read'))) {
+      return res.json({ success: true, data: { isRunning: false, facilityId: null, intervalSeconds: 0, updatesCount: 0, uptimeSeconds: 0 } })
+    }
     res.json({
       success: true,
       data: {

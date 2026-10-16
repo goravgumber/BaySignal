@@ -1,0 +1,136 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String        @id @default(uuid())
+  email        String        @unique
+  passwordHash String
+  name         String
+  role         Role          @default(DRIVER)
+  createdAt    DateTime      @default(now())
+  reservations Reservation[]
+}
+
+enum Role {
+  DRIVER
+  OWNER
+  ADMIN
+}
+
+model Facility {
+  id         String   @id @default(uuid())
+  name       String
+  address    String
+  city       String
+  totalSlots Int      @default(120)
+  lat        Float
+  lng        Float
+  createdAt  DateTime @default(now())
+  zones      Zone[]
+  devices    Device[]
+}
+
+model Zone {
+  id          String        @id @default(uuid())
+  facilityId  String
+  facility    Facility      @relation(fields: [facilityId], references: [id])
+  name        String
+  code        String
+  capacity    Int
+  ratePerHour Float         @default(20)
+  slots       ParkingSlot[]
+}
+
+model ParkingSlot {
+  id           String        @id @default(uuid())
+  zoneId        String
+  zone          Zone          @relation(fields: [zoneId], references: [id])
+  slotCode      String
+  status        SlotStatus    @default(AVAILABLE)
+  slotType      SlotType      @default(STANDARD)
+  updatedAt     DateTime      @updatedAt
+  reservations  Reservation[]
+}
+
+enum SlotStatus {
+  AVAILABLE
+  OCCUPIED
+  RESERVED
+  DISABLED
+}
+
+enum SlotType {
+  STANDARD
+  EV
+  HANDICAP
+  VIP
+}
+
+model Reservation {
+  id              String            @id @default(uuid())
+  reservationCode String            @unique
+  slotId          String
+  slot            ParkingSlot       @relation(fields: [slotId], references: [id])
+  userId          String
+  user            User              @relation(fields: [userId], references: [id])
+  vehicleNumber   String
+  driverName      String
+  driverPhone     String
+  durationHours   Int
+  baseAmount      Float
+  totalAmount     Float
+  status          ReservationStatus @default(UPCOMING)
+  paymentMethod   String            @default("UPI")
+  startTime       DateTime
+  endTime         DateTime
+  createdAt       DateTime          @default(now())
+}
+
+enum ReservationStatus {
+  UPCOMING
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+model Device {
+  id          String       @id @default(uuid())
+  deviceCode  String       @unique
+  facilityId  String
+  facility    Facility     @relation(fields: [facilityId], references: [id])
+  zone        String
+  status      DeviceStatus @default(ONLINE)
+  cpuPercent  Float        @default(0)
+  ramPercent  Float        @default(0)
+  temperature Float        @default(0)
+  lastPingAt  DateTime     @default(now())
+  ipAddress   String       @default("")
+}
+
+enum DeviceStatus {
+  ONLINE
+  OFFLINE
+  MAINTENANCE
+}
+
+model Alert {
+  id          String        @id @default(uuid())
+  facilityId  String
+  severity    AlertSeverity @default(INFO)
+  title       String
+  description String
+  isResolved  Boolean       @default(false)
+  createdAt   DateTime      @default(now())
+}
+
+enum AlertSeverity {
+  CRITICAL
+  WARNING
+  INFO
+}

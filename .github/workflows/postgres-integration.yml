@@ -1,0 +1,55 @@
+name: PostgreSQL Integration Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: baysignal_test_only
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - name: Install server dependencies
+        run: npm ci
+        working-directory: server
+      - name: Run existing unit suite
+        run: npm run test:unit
+        working-directory: server
+      - name: Verify fresh, adoption, and schema-drift migration paths
+        run: npm run test:postgres:migrations
+        working-directory: server
+        env:
+          TEST_DATABASE_ADMIN_URL: postgresql://postgres:baysignal_test_only@127.0.0.1:5432/postgres
+          BAYSIGNAL_TEST_DB_CONFIRMATION: EPHEMERAL-POSTGRES
+      - name: Exercise PostgreSQL constraints, transactions, and tenant routes
+        run: npm run test:postgres:integration
+        working-directory: server
+        env:
+          DATABASE_URL: postgresql://postgres:baysignal_test_only@127.0.0.1:5432/baysignal_test_integration
+          JWT_SECRET: integration-test-only-secret-with-at-least-thirty-two-characters
+          NODE_ENV: test
+          BAYSIGNAL_PG_INTEGRATION: '1'
+          BAYSIGNAL_TEST_DB_CONFIRMATION: EPHEMERAL-POSTGRES

@@ -3,8 +3,9 @@ import { z } from 'zod'
 import { prisma } from '../db.js'
 import { authMiddleware } from '../middleware/auth.js'
 import { getIO } from '../socket.js'
-import { config } from '../config.js'
+import { verifyDeviceIngestion } from '../middleware/deviceAuth.js'
 import { validateBody, validateQuery } from '../middleware/validate.js'
+import { accessibleFacilityIds } from '../tenantAccess.js'
 
 const router = Router()
 const listQuerySchema = z.object({
@@ -17,36 +18,17 @@ const heartbeatSchema = z.object({
   ipAddress: z.string().trim().max(64).optional().default('')
 })
 
-function verifyDeviceIngestion(req, res, next) {
-  if (!config.deviceApiKey) {
-    if (config.nodeEnv === 'production') {
-      return res.status(503).json({
-        success: false,
-        error: 'Device ingestion key is not configured.',
-        code: 503
-      })
-    }
-    return next()
-  }
-
-  const key = req.header('x-device-key')
-  if (!key || key !== config.deviceApiKey) {
-    return res.status(401).json({
-      success: false,
-      error: 'Invalid device API key.',
-      code: 401
-    })
-  }
-  return next()
-}
-
 router.get('/', authMiddleware, validateQuery(listQuerySchema), async (req, res, next) => {
   try {
     const { facilityId } = req.query
+    const facilityIds = await accessibleFacilityIds(prisma, req.user, 'devices_read')
+    if (facilityId && !facilityIds.includes(String(facilityId))) {
+      return res.status(404).json({ success: false, error: 'Facility not found.', code: 404 })
+    }
 
     const devices = await prisma.device.findMany({
       where: {
-        ...(facilityId ? { facilityId: String(facilityId) } : {})
+        facilityId: facilityId ? String(facilityId) : { in: facilityIds }
       },
       orderBy: [{ status: 'asc' }, { deviceCode: 'asc' }]
     })
@@ -61,29 +43,52 @@ router.put('/:id/heartbeat', verifyDeviceIngestion, validateBody(heartbeatSchema
   try {
     const { cpuPercent, ramPercent, temperature, ipAddress } = req.body
 
-    const device = await prisma.device.update({
+    const registeredDevice = await prisma.device.findUnique({
       where: { id: req.params.id },
-      data: {
-        cpuPercent: Number(cpuPercent ?? 0),
-        ramPercent: Number(ramPercent ?? 0),
-        temperature: Number(temperature ?? 0),
-        ipAddress: ipAddress || '',
-        lastPingAt: new Date(),
-        status: 'ONLINE'
-      }
+      include: { facility: { select: { organizationId: true } } }
     })
+    if (!registeredDevice?.facility.organizationId) {
+      return res.status(404).json({ success: false, error: 'Registered device not found.', code: 404 })
+    }
 
-    let generatedAlert = null
-    if (device.cpuPercent > 85 || device.temperature > 78) {
-      generatedAlert = await prisma.alert.create({
+    const { device, generatedAlert } = await prisma.$transaction(async (tx) => {
+      const updatedDevice = await tx.device.update({
+        where: { id: registeredDevice.id },
         data: {
-          facilityId: device.facilityId,
-          severity: 'WARNING',
-          title: `Device threshold alert: ${device.deviceCode}`,
-          description: `CPU ${device.cpuPercent}% / Temp ${device.temperature}C crossed threshold.`
+          cpuPercent: Number(cpuPercent ?? 0),
+          ramPercent: Number(ramPercent ?? 0),
+          temperature: Number(temperature ?? 0),
+          ipAddress: ipAddress || '',
+          lastPingAt: new Date(),
+          status: 'ONLINE'
         }
       })
+      let alert = null
+      if (updatedDevice.cpuPercent > 85 || updatedDevice.temperature > 78) {
+        alert = await tx.alert.create({
+          data: {
+            facilityId: updatedDevice.facilityId,
+            severity: 'WARNING',
+            title: `Device threshold alert: ${updatedDevice.deviceCode}`,
+            description: `CPU ${updatedDevice.cpuPercent}% / Temp ${updatedDevice.temperature}C crossed threshold.`
+          }
+        })
+        await tx.auditEvent.create({
+          data: {
+            organizationId: registeredDevice.facility.organizationId,
+            facilityId: updatedDevice.facilityId,
+            actorSystem: 'device-ingestion',
+            action: 'DEVICE_THRESHOLD_ALERT_CREATED',
+            resourceType: 'Alert',
+            resourceId: alert.id,
+            afterState: { severity: alert.severity, title: alert.title }
+          }
+        })
+      }
+      return { device: updatedDevice, generatedAlert: alert }
+    })
 
+    if (generatedAlert) {
       const io = getIO()
       if (io) {
         io.to(device.facilityId).emit('alert:new', generatedAlert)
@@ -108,11 +113,12 @@ router.put('/:id/heartbeat', verifyDeviceIngestion, validateBody(heartbeatSchema
 
 router.get('/stats', authMiddleware, async (req, res, next) => {
   try {
+    const facilityIds = await accessibleFacilityIds(prisma, req.user, 'devices_read')
     const [total, online, offline, maintenance] = await Promise.all([
-      prisma.device.count(),
-      prisma.device.count({ where: { status: 'ONLINE' } }),
-      prisma.device.count({ where: { status: 'OFFLINE' } }),
-      prisma.device.count({ where: { status: 'MAINTENANCE' } })
+      prisma.device.count({ where: { facilityId: { in: facilityIds } } }),
+      prisma.device.count({ where: { facilityId: { in: facilityIds }, status: 'ONLINE' } }),
+      prisma.device.count({ where: { facilityId: { in: facilityIds }, status: 'OFFLINE' } }),
+      prisma.device.count({ where: { facilityId: { in: facilityIds }, status: 'MAINTENANCE' } })
     ])
 
     res.json({

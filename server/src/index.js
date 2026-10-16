@@ -14,7 +14,7 @@ import helmet from 'helmet'
 import http from 'http'
 import jwt from 'jsonwebtoken'
 import { Server } from 'socket.io'
-import { config } from './config.js'
+import { config, validateRuntimeConfig } from './config.js'
 import authRoutes from './routes/auth.js'
 import parkingRoutes from './routes/parking.js'
 import reservationRoutes from './routes/reservations.js'
@@ -23,14 +23,17 @@ import alertRoutes from './routes/alerts.js'
 import deviceRoutes from './routes/devices.js'
 import voiceRoutes from './routes/voice.js'
 import simulationRoutes from './routes/simulation.js'
+import operationsRoutes from './routes/operations.js'
+import tenantRoutes from './routes/tenants.js'
 
 import { setIO } from './socket.js'
 import { generalRateLimit } from './middleware/rateLimiter.js'
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js'
 import { prisma } from './db.js'
+import { hasFacilityAccess } from './tenantAccess.js'
 
 const app = express()
-app.set('trust proxy', 1)
+app.set('trust proxy', config.trustProxy ? 1 : false)
 
 const httpServer = http.createServer(app)
 
@@ -51,7 +54,7 @@ app.use(
 
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || config.frontendUrl || "*",
+    origin: config.frontendUrl,
     credentials: true
   })
 )
@@ -77,6 +80,8 @@ app.use('/api/alerts', alertRoutes)
 app.use('/api/devices', deviceRoutes)
 app.use('/api/voice', voiceRoutes)
 app.use('/api/simulation', simulationRoutes)
+app.use('/api/operations', operationsRoutes)
+app.use('/api/tenants', tenantRoutes)
 
 io.use((socket, next) => {
   try {
@@ -105,14 +110,9 @@ io.on('connection', (socket) => {
       const userId = socket.data?.user?.id
       if (!userId || !facilityId) return
 
-      const facility = await prisma.facility.findUnique({
-        where: { id: String(facilityId) },
-        select: { id: true }
-      })
-
-      if (!facility) return
-
-      socket.join(facility.id)
+      const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, role: true } })
+      if (!user || !(await hasFacilityAccess(prisma, user, String(facilityId), 'operations_read'))) return
+      socket.join(String(facilityId))
     } catch (error) {
       console.error('Socket join error', error)
     }
@@ -122,15 +122,12 @@ io.on('connection', (socket) => {
 app.use(notFoundHandler)
 app.use(errorHandler)
 
-const PORT = Number(process.env.PORT) || 4000
+const PORT = config.port
 
 async function startServer() {
-  try {
-    await prisma.$connect()
-    console.info('Database connection established.')
-  } catch (error) {
-    console.error('Database connection failed at startup; server will continue running.', error)
-  }
+  validateRuntimeConfig(config)
+  await prisma.$connect()
+  console.info('Database connection established.')
 
   httpServer.listen(PORT, () => {
     console.info(`SmartPark server listening on port ${PORT}`)
@@ -138,7 +135,7 @@ async function startServer() {
 }
 
 startServer().catch((error) => {
-  console.error('Fatal startup error', error)
+  console.error('Fatal startup error:', error.message)
   process.exit(1)
 })
 
