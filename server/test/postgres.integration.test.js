@@ -86,20 +86,25 @@ test('PostgreSQL constraints, audited services, and tenant routes', { skip: !ena
     const foreignToken = tokenFor(foreignManager)
     const driverToken = tokenFor(driver)
 
-    const signDeviceCall = ({ method = 'PUT', path, deviceId, credential, body, requestId = randomUUID(), timestamp = Math.floor(Date.now() / 1000) }) => {
+    const deviceHeaders = ({ method = 'PUT', path, deviceId, credential, body, requestId = randomUUID(), timestamp = Math.floor(Date.now() / 1000) }) => {
       const rawBody = Buffer.from(body)
       const timestampText = String(timestamp)
       const bodyHash = createHash('sha256').update(rawBody).digest('hex')
       const canonical = `${method}\n${path}\n${timestampText}\n${requestId}\n${bodyHash}`
       const signature = signEd25519(null, Buffer.from(canonical), createPrivateKey({ key: Buffer.from(credential.privateKey, 'base64url'), format: 'der', type: 'pkcs8' })).toString('base64url')
-      return request(path, null, { method, body, headers: {
+      return {
         'x-device-credential-id': credential.credential.id,
         'x-device-id': deviceId,
         'x-device-timestamp': timestampText,
         'x-device-request-id': requestId,
         'x-device-signature': signature
-      } })
+      }
     }
+    const signDeviceCall = (options) => request(options.path, null, {
+      method: options.method || 'PUT',
+      body: options.body,
+      headers: deviceHeaders(options)
+    })
 
     await t.test('device credentials are scoped, signed, revocable, replay-safe, and transactional', async () => {
       const deviceA = await prisma.device.create({ data: { deviceCode: `device-a-${unique}`, facilityId: facilityA.id, zone: 'A' } })
@@ -132,8 +137,7 @@ test('PostgreSQL constraints, audited services, and tenant routes', { skip: !ena
 
       const tampered = JSON.stringify({ cpuPercent: 99, ramPercent: 20, temperature: 30 })
       const tamperRequestId = randomUUID()
-      const tamperBase = await signDeviceCall({ path: heartbeatPath, deviceId: deviceA.id, credential: issued, body, requestId: tamperRequestId })
-      const tamperHeaders = Object.fromEntries(tamperBase.headers)
+      const tamperHeaders = deviceHeaders({ path: heartbeatPath, deviceId: deviceA.id, credential: issued, body, requestId: tamperRequestId })
       const tamperedResponse = await request(heartbeatPath, null, { method: 'PUT', body: tampered, headers: tamperHeaders })
       assert.equal(tamperedResponse.status, 401)
       const signatureLastChar = tamperHeaders['x-device-signature'].slice(-1)
