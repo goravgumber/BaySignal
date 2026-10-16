@@ -2,10 +2,15 @@ name: PostgreSQL Integration Tests
 
 on:
   pull_request:
-  push:
     branches:
       - main
+  push:
+    branches:
+      - feature/baysignal-production-implementation
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   postgres:
