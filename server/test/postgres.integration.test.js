@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
+import { createServer } from 'node:http'
 
 const enabled = process.env.BAYSIGNAL_PG_INTEGRATION === '1'
 test('PostgreSQL constraints, audited services, and tenant routes', { skip: !enabled }, async (t) => {
@@ -12,12 +13,16 @@ test('PostgreSQL constraints, audited services, and tenant routes', { skip: !ena
   assert.equal(databaseTarget.pathname, '/baysignal_test_integration', 'integration tests require the named disposable database')
   assert.equal(databaseTarget.search, '', 'integration tests refuse database URL overrides')
   assert.equal(databaseTarget.hash, '', 'integration tests refuse database URL fragments')
-  const [{ PrismaClient }, jwt, expressModule, operationsModule, reservationsModule, authModule, { prisma: routePrisma }, { config }, { reconcileSlotEvidence }, { processVerifiedGateEvent }] = await Promise.all([
+  const [{ PrismaClient }, jwt, expressModule, operationsModule, reservationsModule, authModule, { prisma: routePrisma }, { config }, { reconcileSlotEvidence }, { processVerifiedGateEvent }, socketServerModule, socketClientModule, socketAccessModule] = await Promise.all([
     import('@prisma/client'), import('jsonwebtoken'), import('express'), import('../src/routes/operations.js'),
     import('../src/routes/reservations.js'), import('../src/routes/auth.js'), import('../src/db.js'), import('../src/config.js'),
-    import('../src/services/reconcileEvidence.js'), import('../src/services/gateEvents.js')
+    import('../src/services/reconcileEvidence.js'), import('../src/services/gateEvents.js'), import('socket.io'),
+    import('socket.io-client'), import('../src/socketAccess.js')
   ])
   const express = expressModule.default
+  const { Server } = socketServerModule
+  const socketClient = socketClientModule.io
+  const { installSocketAccess } = socketAccessModule
   const operationsRoutes = operationsModule.default
   const reservationRoutes = reservationsModule.default
   const authRoutes = authModule.default
@@ -29,8 +34,10 @@ test('PostgreSQL constraints, audited services, and tenant routes', { skip: !ena
   app.use('/api/reservations', reservationRoutes)
   app.use('/api/operations', operationsRoutes)
   app.use((error, req, res, next) => res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : 'Internal error' }))
-  const server = app.listen(0)
-  await new Promise((resolve) => server.once('listening', resolve))
+  const server = createServer(app)
+  const socketServer = new Server(server, { serveClient: false })
+  installSocketAccess(socketServer, { prisma, jwtSecret: config.jwtSecret })
+  await new Promise((resolve) => server.listen(0, resolve))
   const base = `http://127.0.0.1:${server.address().port}`
   const unique = randomUUID()
   const vehicleReference = (salt) => createHash('sha256').update(`${unique}:${salt}`).digest('hex')
@@ -121,6 +128,36 @@ test('PostgreSQL constraints, audited services, and tenant routes', { skip: !ena
       const legacyFacility = await prisma.facility.create({ data: { name: `Legacy ${unique}`, address: 'Old Road', city: 'Old City', totalSlots: 0, lat: 0, lng: 0 } })
       const refreshedVisits = await request('/api/operations/visits', managerToken)
       assert.equal((await refreshedVisits.json()).data.some((visit) => visit.facilityId === legacyFacility.id), false)
+    })
+
+    await t.test('socket authentication and facility room joins enforce tenant access', async () => {
+      const invalidSocket = socketClient(base, { auth: { token: 'invalid-test-token' }, reconnection: false, timeout: 1000, transports: ['websocket'] })
+      const invalidResult = await new Promise((resolve) => {
+        invalidSocket.once('connect', () => resolve('connected'))
+        invalidSocket.once('connect_error', () => resolve('rejected'))
+      })
+      invalidSocket.close()
+      assert.equal(invalidResult, 'rejected')
+
+      const managerSocket = socketClient(base, { auth: { token: managerToken }, reconnection: false, timeout: 1000, transports: ['websocket'] })
+      await new Promise((resolve, reject) => {
+        managerSocket.once('connect', resolve)
+        managerSocket.once('connect_error', reject)
+      })
+      managerSocket.emit('join:facility', facilityA.id)
+      await waitFor(() => socketServer.sockets.sockets.get(managerSocket.id)?.rooms.has(facilityA.id))
+      assert.equal(socketServer.sockets.sockets.get(managerSocket.id)?.rooms.has(facilityA.id), true)
+
+      const foreignSocket = socketClient(base, { auth: { token: foreignToken }, reconnection: false, timeout: 1000, transports: ['websocket'] })
+      await new Promise((resolve, reject) => {
+        foreignSocket.once('connect', resolve)
+        foreignSocket.once('connect_error', reject)
+      })
+      foreignSocket.emit('join:facility', facilityA.id)
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      assert.equal(socketServer.sockets.sockets.get(foreignSocket.id)?.rooms.has(facilityA.id), false)
+      managerSocket.close()
+      foreignSocket.close()
     })
 
     let discrepancy
@@ -231,7 +268,15 @@ test('PostgreSQL constraints, audited services, and tenant routes', { skip: !ena
       await assert.rejects(prisma.gateEvent.create({ data: { organizationId: orgB.id, facilityId: facilityA.id, sourceEventId: vehicleReference('cross-tenant-source'), deduplicationKey: vehicleReference('cross-tenant-dedup'), direction: 'INBOUND', eventAt: new Date(), provenance: 'integration-test' } }))
     })
   } finally {
-    await new Promise((resolve) => server.close(resolve))
+    await new Promise((resolve) => socketServer.close(resolve))
     await Promise.all([prisma.$disconnect(), routePrisma.$disconnect()])
   }
 })
+
+async function waitFor(predicate, timeoutMs = 1000) {
+  const start = Date.now()
+  while (!predicate()) {
+    if (Date.now() - start >= timeoutMs) throw new Error('Timed out waiting for socket room authorization decision.')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}

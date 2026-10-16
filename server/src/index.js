@@ -12,7 +12,6 @@ import cors from 'cors'
 import express from 'express'
 import helmet from 'helmet'
 import http from 'http'
-import jwt from 'jsonwebtoken'
 import { Server } from 'socket.io'
 import { config, validateRuntimeConfig } from './config.js'
 import authRoutes from './routes/auth.js'
@@ -30,7 +29,7 @@ import { setIO } from './socket.js'
 import { generalRateLimit } from './middleware/rateLimiter.js'
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js'
 import { prisma } from './db.js'
-import { hasFacilityAccess } from './tenantAccess.js'
+import { installSocketAccess } from './socketAccess.js'
 
 const app = express()
 app.set('trust proxy', config.trustProxy ? 1 : false)
@@ -83,41 +82,7 @@ app.use('/api/simulation', simulationRoutes)
 app.use('/api/operations', operationsRoutes)
 app.use('/api/tenants', tenantRoutes)
 
-io.use((socket, next) => {
-  try {
-    const authToken = socket.handshake?.auth?.token
-    const headerToken = socket.handshake?.headers?.authorization?.replace('Bearer ', '')
-    const token = authToken || headerToken
-
-    if (!token) {
-      return next(new Error('Unauthorized socket connection.'))
-    }
-
-    const decoded = jwt.verify(token, config.jwtSecret)
-    socket.data.user = decoded
-    return next()
-  } catch (error) {
-    console.error('Socket auth error', error?.message || error)
-    return next(new Error('Unauthorized socket connection.'))
-  }
-})
-
-io.on('connection', (socket) => {
-  console.info(`Socket connected: ${socket.id}`)
-
-  socket.on('join:facility', async (facilityId) => {
-    try {
-      const userId = socket.data?.user?.id
-      if (!userId || !facilityId) return
-
-      const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, role: true } })
-      if (!user || !(await hasFacilityAccess(prisma, user, String(facilityId), 'operations_read'))) return
-      socket.join(String(facilityId))
-    } catch (error) {
-      console.error('Socket join error', error)
-    }
-  })
-})
+installSocketAccess(io, { prisma, jwtSecret: config.jwtSecret })
 
 app.use(notFoundHandler)
 app.use(errorHandler)
