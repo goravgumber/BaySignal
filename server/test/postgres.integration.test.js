@@ -150,7 +150,7 @@ test('PostgreSQL constraints, audited services, and tenant routes', { skip: !ena
 
       const piPath = '/api/simulation/pi-payload'
       const piBody = JSON.stringify({ parking_id: facilityB.id, device_id: deviceA.id, timestamp: new Date().toISOString(), slots: {} })
-      const wrongFacility = await signDeviceCall({ path: piPath, deviceId: deviceA.id, credential: issued, body: piBody })
+      const wrongFacility = await signDeviceCall({ method: 'POST', path: piPath, deviceId: deviceA.id, credential: issued, body: piBody })
       assert.equal(wrongFacility.status, 401)
       const validPiBody = JSON.stringify({ parking_id: facilityA.id, device_id: deviceA.id, timestamp: new Date().toISOString(), slots: {} })
       const validPi = await signDeviceCall({ method: 'POST', path: piPath, deviceId: deviceA.id, credential: issued, body: validPiBody })
