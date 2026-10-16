@@ -164,7 +164,7 @@ Backend runtime requirements:
 - `JWT_SECRET`
 - `NODE_ENV=production`
 - `FRONTEND_URL=https://smartpark-client.onrender.com`
-- `DEVICE_API_KEY`
+- Per-device Ed25519 credentials issued through the authorized device management API; no global device key is required.
 
 Frontend runtime requirements:
 
@@ -174,6 +174,12 @@ Frontend runtime requirements:
 ## Demo Credentials
 
 Demo passwords were removed from the repository. Configure credentials locally and rotate any previously disclosed demo account credentials before continued use.
+
+### Device ingestion authentication
+
+Device credential issuance and revocation are scoped to a facility and audited. Issuance returns an Ed25519 PKCS#8 private key once; the server stores only the corresponding public key. A device signs the exact raw JSON body and request metadata; it must keep its private key in protected device storage and send requests over HTTPS. See `docs/SECURITY_REVIEW.md` for the canonical signing format and staged legacy-key cutoff. The legacy global key is disabled by default and should only be enabled temporarily with an explicit expiration during a controlled client migration.
+
+The Raspberry Pi sample sender requires the device ID, credential ID, one-time private key, facility ID and server URL in its environment. Install its Python dependencies with `python -m pip install -r raspberry_pi/requirements.txt`. The sample's current occupancy generator remains simulation behavior; it does not represent measured camera or sensor data.
 
 ## Hackathon Judge Flow
 

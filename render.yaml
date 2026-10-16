@@ -20,8 +20,6 @@ services:
         value: production
       - key: FRONTEND_URL
         value: https://smartpark-client.onrender.com
-      - key: DEVICE_API_KEY
-        generateValue: true
       - key: TRUST_PROXY
         value: true
 
