@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
+import { readFile, readdir } from 'node:fs/promises'
 import pg from 'pg'
 
 const { Client } = pg
@@ -18,6 +18,12 @@ if (!allowedHosts.has(parsedAdmin.hostname) || parsedAdmin.port !== '5432' || pa
 const admin = new Client({ connectionString: adminUrl })
 const names = ['baysignal_test_fresh', 'baysignal_test_adoption', 'baysignal_test_drift', 'baysignal_test_integration']
 const migrationSql = await readFile(new URL('../prisma/migrations/20261015100000_baseline/migration.sql', import.meta.url), 'utf8')
+const migrationDirectories = await readdir(new URL('../prisma/migrations/', import.meta.url), { withFileTypes: true })
+const expectedMigrationChain = migrationDirectories
+  .filter((entry) => entry.isDirectory())
+  .map((entry) => entry.name)
+  .sort()
+  .join(',')
 const prismaCli = new URL('../node_modules/prisma/build/index.js', import.meta.url)
 let integrationReady = false
 
@@ -83,7 +89,7 @@ try {
       throw new Error('Adoption changed or lost the legacy user/facility record.')
     }
     const migrations = await db.query(`SELECT migration_name FROM "_prisma_migrations" ORDER BY migration_name`)
-    if (migrations.rows.map((row) => row.migration_name).join(',') !== '20261015100000_baseline,20261015101000_add_tenant_presence_evidence_audit') {
+    if (migrations.rows.map((row) => row.migration_name).join(',') !== expectedMigrationChain) {
       throw new Error('Adoption recorded an unexpected migration chain.')
     }
   })

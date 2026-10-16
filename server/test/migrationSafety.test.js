@@ -43,6 +43,12 @@ test('device credential migration stores public keys and enforces per-device rep
   assert.match(deviceSql, /"ingestionEnabled" BOOLEAN NOT NULL DEFAULT true/)
 })
 
+test('PostgreSQL adoption harness validates the complete current migration chain', () => {
+  const migrationHarness = readFileSync(new URL('../scripts/test-postgres-migrations.js', import.meta.url), 'utf8')
+  assert.match(migrationHarness, /const expectedMigrationChain = migrationDirectories/)
+  assert.match(migrationHarness, /!== expectedMigrationChain/)
+})
+
 test('PostgreSQL harness is restricted to the named loopback test databases', () => {
   const migrationHarness = readFileSync(new URL('../scripts/test-postgres-migrations.js', import.meta.url), 'utf8')
   const integrationRunner = readFileSync(new URL('../scripts/run-postgres-integration.js', import.meta.url), 'utf8')
