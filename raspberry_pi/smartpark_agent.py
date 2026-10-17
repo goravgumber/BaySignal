@@ -20,9 +20,28 @@ SERVER_URL = os.environ.get("BAYSIGNAL_SERVER_URL", "http://localhost:4000").rst
 DEVICE_ID = os.environ.get("BAYSIGNAL_DEVICE_ID", "")
 DEVICE_CREDENTIAL_ID = os.environ.get("BAYSIGNAL_DEVICE_CREDENTIAL_ID", "")
 DEVICE_PRIVATE_KEY = os.environ.get("BAYSIGNAL_DEVICE_PRIVATE_KEY", "")
+DEVICE_PRIVATE_KEY_PATH = os.environ.get("BAYSIGNAL_DEVICE_PRIVATE_KEY_PATH", "")
+ENDPOINT_PATH = os.environ.get("BAYSIGNAL_ENDPOINT_PATH", "")
 FACILITY_ID = os.environ.get("BAYSIGNAL_FACILITY_ID", "")
 SEND_INTERVAL_SECONDS = 3
 USE_CAMERA = False
+
+def load_private_key():
+    if DEVICE_PRIVATE_KEY_PATH:
+        if os.name == "posix":
+            st = os.stat(DEVICE_PRIVATE_KEY_PATH)
+            if st.st_mode & 0o077 != 0:
+                print(f"{YELLOW}Warning: key file {DEVICE_PRIVATE_KEY_PATH} has open permissions ({oct(st.st_mode)}). Recommend chmod 600.{RESET}")
+        with open(DEVICE_PRIVATE_KEY_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    return DEVICE_PRIVATE_KEY
+
+def get_endpoint_path():
+    if ENDPOINT_PATH:
+        return ENDPOINT_PATH
+    if DEVICE_ID:
+        return f"/api/devices/{DEVICE_ID}/observations"
+    return "/api/simulation/pi-payload"
 
 SLOT_ZONES = [
     { "slot_code": "A-01", "x": 0,   "y": 0, "w": 320, "h": 480 },
@@ -76,8 +95,9 @@ def get_device_health():
 def send_payload(payload):
     try:
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        path = "/api/simulation/pi-payload"
-        headers = signed_request_headers(DEVICE_ID, DEVICE_CREDENTIAL_ID, DEVICE_PRIVATE_KEY, "POST", path, body)
+        path = get_endpoint_path()
+        private_key = load_private_key()
+        headers = signed_request_headers(DEVICE_ID, DEVICE_CREDENTIAL_ID, private_key, "POST", path, body)
         headers["Content-Type"] = "application/json"
         response = requests.post(
             f"{SERVER_URL}{path}",

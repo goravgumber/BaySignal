@@ -26,3 +26,18 @@ test('device signature canonical bytes bind method, exact URL, timestamp, reques
   })
   assert.equal(verify(null, Buffer.from(changedBody), publicKey, signature), false)
 })
+
+test('device signature canonical bytes bind observation ingestion requests', () => {
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519')
+  const rawBody = Buffer.from('{"parking_id":"fac-uuid","timestamp":"2026-10-17T00:00:00Z","slots":{"A-01":"available"}}')
+  const canonical = deviceCanonicalRequest({
+    method: 'POST',
+    path: '/api/devices/device-uuid/observations',
+    timestamp: '1792140500',
+    requestId: '99a7c6bf-ea42-4fc7-a843-e3bc89eaebdf',
+    rawBody
+  })
+  const signature = sign(null, Buffer.from(canonical), privateKey)
+  assert.equal(verify(null, Buffer.from(canonical), publicKey, signature), true)
+  assert.equal(verify(null, Buffer.from(canonical.replace('device-uuid', 'other-device')), publicKey, signature), false)
+})

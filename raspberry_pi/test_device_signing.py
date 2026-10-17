@@ -44,6 +44,25 @@ class DeviceSigningTests(unittest.TestCase):
         with self.assertRaises(InvalidSignature):
             self.public_key.verify(signature, changed)
 
+    def test_signature_for_device_observation_endpoint(self):
+        raw_body = b'{"parking_id":"fac-123","timestamp":"2026-10-17T00:00:00Z","slots":{"A-01":"available"}}'
+        path = "/api/devices/dev-456/observations"
+        headers = signed_request_headers(
+            "dev-456",
+            "cred-789",
+            self.private_key_base64url,
+            "POST",
+            path,
+            raw_body,
+            timestamp=1792140500,
+            request_id="88888888-4444-4444-4444-121212121212"
+        )
+        signature = base64.urlsafe_b64decode(headers["X-Device-Signature"] + "==")
+        canonical = canonical_request("POST", path, "1792140500", "88888888-4444-4444-4444-121212121212", raw_body)
+        self.public_key.verify(signature, canonical)
+        self.assertEqual(headers["X-Device-Id"], "dev-456")
+        self.assertEqual(headers["X-Device-Credential-Id"], "cred-789")
+
 
 if __name__ == "__main__":
     unittest.main()

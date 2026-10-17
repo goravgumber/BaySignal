@@ -34,6 +34,15 @@ test('PostgreSQL constraints, audited services, and tenant routes', { skip: !ena
   const prisma = new PrismaClient()
   const app = express()
   app.use(express.json({ verify: (req, res, buffer) => { req.rawBody = Buffer.from(buffer) } }))
+  app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString(), uptime: process.uptime() }))
+  app.get('/health/ready', async (req, res) => {
+    try {
+      await prisma.$queryRaw`SELECT 1`
+      res.json({ status: 'ready', database: 'connected', timestamp: new Date().toISOString() })
+    } catch {
+      res.status(503).json({ status: 'not_ready', database: 'disconnected', timestamp: new Date().toISOString() })
+    }
+  })
   app.use('/api/auth', authRoutes)
   app.use('/api/reservations', reservationRoutes)
   app.use('/api/operations', operationsRoutes)
@@ -225,6 +234,62 @@ test('PostgreSQL constraints, audited services, and tenant routes', { skip: !ena
       const revokedAudit = await prisma.auditEvent.findFirst({ where: { action: 'DEVICE_CREDENTIAL_REVOKED', resourceId: issued.credential.id } })
       assert.ok(revokedAudit)
       assert.equal(JSON.stringify(revokedAudit).includes(issued.privateKey), false)
+
+      // Test device registration (POST /api/devices)
+      const registerRes = await request('/api/devices', managerToken, {
+        method: 'POST',
+        body: JSON.stringify({ facilityId: facilityA.id, deviceCode: `new-device-${unique}`, zone: 'A' })
+      })
+      assert.equal(registerRes.status, 201)
+      const registeredData = (await registerRes.json()).data
+      assert.equal(registeredData.deviceCode, `new-device-${unique}`)
+      const regAudit = await prisma.auditEvent.findFirst({ where: { action: 'DEVICE_REGISTERED', resourceId: registeredData.id } })
+      assert.ok(regAudit)
+
+      const foreignRegister = await request('/api/devices', foreignToken, {
+        method: 'POST',
+        body: JSON.stringify({ facilityId: facilityA.id, deviceCode: `unauthorized-${unique}`, zone: 'A' })
+      })
+      assert.equal(foreignRegister.status, 404)
+
+      // Test device observations ingestion (POST /api/devices/:id/observations)
+      const obsBody = JSON.stringify({
+        parking_id: facilityA.id,
+        timestamp: new Date().toISOString(),
+        slots: { [`facility-a-${unique}-1`]: 'occupied' },
+        confidence: 0.95
+      })
+      const obsResponse = await signDeviceCall({
+        method: 'POST',
+        path: `/api/devices/${deviceA.id}/observations`,
+        deviceId: deviceA.id,
+        credential: rotated,
+        body: obsBody
+      })
+      assert.equal(obsResponse.status, 200)
+      const obsData = (await obsResponse.json()).data
+      assert.equal(obsData.processed, true)
+      assert.equal(obsData.slotsObserved, 1)
+
+      const storedObs = await prisma.bayObservation.findFirst({
+        where: { deviceId: deviceA.id, source: 'DEVICE_REPORT' }
+      })
+      assert.ok(storedObs)
+      assert.equal(storedObs.result, 'OCCUPIED')
+
+      // Test diagnostics endpoint (GET /api/devices/diagnostics)
+      const diagRes = await request('/api/devices/diagnostics', managerToken)
+      assert.equal(diagRes.status, 200)
+      const diagData = (await diagRes.json()).data
+      assert.ok(diagData.devices.length >= 1)
+      assert.ok(diagData.summary.total >= 1)
+
+      // Test readiness endpoint (GET /health/ready)
+      const readyRes = await request('/health/ready', null)
+      assert.equal(readyRes.status, 200)
+      const readyData = await readyRes.json()
+      assert.equal(readyData.status, 'ready')
+      assert.equal(readyData.database, 'connected')
     })
 
     await t.test('tenant route authorization and public registration', async () => {

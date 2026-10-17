@@ -22,7 +22,7 @@ import { generalRateLimit } from './middleware/rateLimiter.js'
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js'
 import { prisma } from './db.js'
 import { installSocketAccess } from './socketAccess.js'
-import { logProcessError } from './safeLogging.js'
+import { logDiagnostic, logProcessError } from './safeLogging.js'
 
 process.on('uncaughtException', (err) => logProcessError('uncaught_exception', err))
 process.on('unhandledRejection', (err) => logProcessError('unhandled_rejection', err))
@@ -70,6 +70,27 @@ app.get('/health', (req, res) => {
   })
 })
 
+app.get('/health/ready', async (req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`
+    res.json({
+      status: 'ready',
+      database: 'connected',
+      timestamp: new Date().toISOString()
+    })
+  } catch (error) {
+    logDiagnostic('readiness_check_failed', {
+      errorName: error?.name || 'Error',
+      errorCode: typeof error?.code === 'string' ? error.code : undefined
+    })
+    res.status(503).json({
+      status: 'not_ready',
+      database: 'disconnected',
+      timestamp: new Date().toISOString()
+    })
+  }
+})
+
 console.log("⚙️ Registering routes...")
 
 app.use('/api/auth', authRoutes)
@@ -89,6 +110,26 @@ app.use(notFoundHandler)
 app.use(errorHandler)
 
 const PORT = config.port
+
+function gracefulShutdown(signal) {
+  console.info(`Received ${signal}, initiating graceful shutdown...`)
+  httpServer.close(async () => {
+    try {
+      if (io) {
+        await io.close()
+      }
+      await prisma.$disconnect()
+      console.info('Graceful shutdown complete.')
+      process.exit(0)
+    } catch (err) {
+      logProcessError('shutdown_error', err)
+      process.exit(1)
+    }
+  })
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+process.on('SIGINT', () => gracefulShutdown('SIGINT'))
 
 async function startServer() {
   validateRuntimeConfig(config)
