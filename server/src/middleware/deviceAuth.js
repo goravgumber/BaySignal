@@ -1,6 +1,7 @@
 import { createHash, createPublicKey, timingSafeEqual, verify as verifySignature } from 'node:crypto'
 import { config } from '../config.js'
 import { prisma } from '../db.js'
+import { logDiagnostic } from '../safeLogging.js'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const SIGNATURE = /^[A-Za-z0-9_-]{86}$/
@@ -10,7 +11,8 @@ export function deviceCanonicalRequest({ method, path, timestamp, requestId, raw
   return `${method.toUpperCase()}\n${path}\n${timestamp}\n${requestId}\n${bodyHash}`
 }
 
-function invalidDeviceAuth(res) {
+function invalidDeviceAuth(res, reason = 'unspecified', details = {}) {
+  logDiagnostic('device_auth_rejected', { reason, ...details })
   return res.status(401).json({ success: false, error: 'Invalid device authentication.', code: 401 })
 }
 
@@ -28,9 +30,11 @@ export async function verifyDeviceIngestion(req, res, next) {
     // Time-limited compatibility for already-deployed legacy clients. It is off by default.
     if (req.header('x-device-key') && config.allowLegacyDeviceApiKey && Date.now() < Date.parse(config.legacyDeviceApiKeyExpiresAt)) {
       const suppliedKey = req.header('x-device-key')
-      if (!safeEqual(suppliedKey, config.legacyDeviceApiKey)) return invalidDeviceAuth(res)
+      if (!safeEqual(suppliedKey, config.legacyDeviceApiKey)) return invalidDeviceAuth(res, 'legacy_key_mismatch')
       const legacyDevice = await resolveRequestedDevice(req, deviceId)
-      if (!legacyDevice || legacyDevice.status === 'MAINTENANCE' || !legacyDevice.ingestionEnabled || !requestMatchesDevice(req, legacyDevice, true)) return invalidDeviceAuth(res)
+      if (!legacyDevice || legacyDevice.status === 'MAINTENANCE' || !legacyDevice.ingestionEnabled || !requestMatchesDevice(req, legacyDevice, true)) {
+        return invalidDeviceAuth(res, 'legacy_device_invalid_or_disabled', { deviceId })
+      }
       req.deviceAuth = { device: legacyDevice, legacy: true }
       return next()
     }
@@ -40,7 +44,7 @@ export async function verifyDeviceIngestion(req, res, next) {
     const signature = req.header('x-device-signature')
     if (!credentialId || !UUID.test(credentialId) || !deviceId || !UUID.test(deviceId) ||
       !timestamp || !/^\d{10}$/.test(timestamp) || !requestId || !UUID.test(requestId) || !signature || !SIGNATURE.test(signature) ||
-      !Buffer.isBuffer(req.rawBody)) return invalidDeviceAuth(res)
+      !Buffer.isBuffer(req.rawBody)) return invalidDeviceAuth(res, 'missing_or_malformed_headers', { deviceId })
 
     const credential = await prisma.deviceCredential.findFirst({
       where: { id: credentialId, deviceId, revokedAt: null },
@@ -49,12 +53,19 @@ export async function verifyDeviceIngestion(req, res, next) {
         device: { select: { id: true, facilityId: true, status: true, ingestionEnabled: true } }
       }
     })
-    if (!credential || credential.device.status === 'MAINTENANCE' || !credential.device.ingestionEnabled ||
-      !requestMatchesDevice(req, credential.device)) return invalidDeviceAuth(res)
+    if (!credential) return invalidDeviceAuth(res, 'credential_not_found_or_revoked', { deviceId, credentialId })
+    if (credential.device.status === 'MAINTENANCE' || !credential.device.ingestionEnabled) {
+      return invalidDeviceAuth(res, 'device_maintenance_or_disabled', { deviceId })
+    }
+    if (!requestMatchesDevice(req, credential.device)) {
+      return invalidDeviceAuth(res, 'device_mismatch', { deviceId })
+    }
 
     const nowSeconds = Math.floor(Date.now() / 1000)
     const requestSeconds = Number(timestamp)
-    if (Math.abs(nowSeconds - requestSeconds) > config.deviceRequestWindowSeconds) return invalidDeviceAuth(res)
+    if (Math.abs(nowSeconds - requestSeconds) > config.deviceRequestWindowSeconds) {
+      return invalidDeviceAuth(res, 'timestamp_out_of_window', { deviceId, deltaSeconds: nowSeconds - requestSeconds })
+    }
 
     let validSignature = false
     try {
@@ -68,7 +79,7 @@ export async function verifyDeviceIngestion(req, res, next) {
     } catch {
       validSignature = false
     }
-    if (!validSignature) return invalidDeviceAuth(res)
+    if (!validSignature) return invalidDeviceAuth(res, 'invalid_signature', { deviceId, credentialId })
 
     req.deviceAuth = {
       device: credential.device,
@@ -111,6 +122,7 @@ export async function consumeDeviceRequest(tx, deviceAuth) {
   })
   const device = await tx.device.findUnique({ where: { id: deviceAuth.device.id }, select: { ingestionEnabled: true, status: true } })
   if (!credential || !device?.ingestionEnabled || device.status === 'MAINTENANCE') {
+    logDiagnostic('device_request_rejected', { reason: 'credential_invalid_in_transaction', deviceId: deviceAuth.device?.id })
     const error = new Error('Invalid device authentication.')
     error.statusCode = 401
     throw error
