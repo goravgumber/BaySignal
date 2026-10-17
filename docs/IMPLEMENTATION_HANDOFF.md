@@ -199,6 +199,11 @@ No local/production database connection, production migration, seed, administrat
   7. **Tenant Onboarding Dry-Run Utility:** Added `server/scripts/onboarding-dry-run.js` (executable via `npm run tenant:dry-run`). Inspects unassigned legacy facilities and unmapped users; validates proposed JSON onboarding plans; checks that facilities exist and are unassigned, organizations exist, and role assignments are valid; and guarantees no cross-tenant crossover without making database writes.
   8. **Raspberry Pi Agent Hardening:** Updated `raspberry_pi/smartpark_agent.py` to support `BAYSIGNAL_ENDPOINT_PATH` (defaulting to `/api/devices/{DEVICE_ID}/observations`) and file-based private key loading via `BAYSIGNAL_DEVICE_PRIVATE_KEY_PATH` with POSIX file permission checks (`chmod 600`).
   9. **Expanded Tests:** Added tests in `server/test/safeLogging.test.js`, `server/test/deviceAuth.test.js`, `server/test/postgres.integration.test.js`, and `raspberry_pi/test_device_signing.py`.
+- **GitHub Actions & CI Results:**
+  - Pull Request: [PR #4 (Draft)](https://github.com/goravgumber/BaySignal/pull/4) against `main`.
+  - Workflow run: [Run 39002602847](https://github.com/goravgumber/BaySignal/actions/runs/39002602847) completed successfully on push to `feature/controlled-pilot-preparation`.
+  - Quality Job (ID 117308502488): Installed dependencies, validated/generated Prisma client, passed both client and server production dependency audits (0 vulnerabilities), passed client Vite build (`dist/`), passed **37 server unit tests (0 failed, 1 skipped)**, and passed **3 Python device signing tests (0 failed)**.
+  - PostgreSQL 16 Job (ID 117308502680): Verified all 3 migration paths (fresh empty DB deployment, existing schema adoption retaining legacy data, and refusal upon unreviewed schema drift), and passed all **8 PostgreSQL integration tests (0 failed, 0 skipped)** covering device registration, scoped Ed25519 signatures, replay rejection, observations ingestion, diagnostics, readiness, tenant HTTP routes, and Socket.IO authorization.
 - **Verification results:**
   - `npm run test:unit` in `server/`: **37 passed, 0 failed, 1 optional PostgreSQL test skipped** (38 total).
   - Client production build (`npm run build` in `client/`): **passed** (`dist/` generated cleanly in 7.6s).
