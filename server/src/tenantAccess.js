@@ -5,7 +5,7 @@ const rolesByPermission = {
   reservations_write: ['FACILITY_MANAGER', 'ATTENDANT', 'DRIVER'],
   reservation_checkin: ['FACILITY_MANAGER', 'ATTENDANT'],
   devices_read: ['FACILITY_MANAGER', 'DEVICE_TECHNICIAN'],
-  devices_write: ['DEVICE_TECHNICIAN'],
+  devices_write: ['FACILITY_MANAGER', 'DEVICE_TECHNICIAN'],
   alerts_read: ['FACILITY_MANAGER', 'ATTENDANT', 'DEVICE_TECHNICIAN', 'VIEWER'],
   alerts_write: ['FACILITY_MANAGER'],
   analytics_read: ['FACILITY_MANAGER', 'FINANCE', 'VIEWER'],

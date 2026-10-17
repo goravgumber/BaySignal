@@ -5,8 +5,10 @@ import socket
 import json
 import requests
 import psutil
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import Lock
+from urllib.parse import urlsplit
+from device_signing import signed_request_headers
 
 try:
     import cv2
@@ -15,9 +17,10 @@ except ImportError:
     CV2_AVAILABLE = False
 
 SERVER_URL = os.environ.get("BAYSIGNAL_SERVER_URL", "http://localhost:4000").rstrip("/")
-DEVICE_API_KEY = os.environ.get("BAYSIGNAL_DEVICE_API_KEY", "")
-FACILITY_ID = "348efc36-7857-4569-a402-730186287dda"
-DEVICE_CODE = "RAPI-01"
+DEVICE_ID = os.environ.get("BAYSIGNAL_DEVICE_ID", "")
+DEVICE_CREDENTIAL_ID = os.environ.get("BAYSIGNAL_DEVICE_CREDENTIAL_ID", "")
+DEVICE_PRIVATE_KEY = os.environ.get("BAYSIGNAL_DEVICE_PRIVATE_KEY", "")
+FACILITY_ID = os.environ.get("BAYSIGNAL_FACILITY_ID", "")
 SEND_INTERVAL_SECONDS = 3
 USE_CAMERA = False
 
@@ -72,19 +75,19 @@ def get_device_health():
 
 def send_payload(payload):
     try:
-        headers = {
-            "X-Device-Key": DEVICE_API_KEY,
-            "Content-Type": "application/json"
-        }
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        path = "/api/simulation/pi-payload"
+        headers = signed_request_headers(DEVICE_ID, DEVICE_CREDENTIAL_ID, DEVICE_PRIVATE_KEY, "POST", path, body)
+        headers["Content-Type"] = "application/json"
         response = requests.post(
-            f"{SERVER_URL}/api/simulation/pi-payload",
-            json=payload,
+            f"{SERVER_URL}{path}",
+            data=body,
             headers=headers,
             timeout=10
         )
         return response.status_code
-    except Exception as e:
-        print(f"{RED}Payload send error: {e}{RESET}")
+    except Exception as error:
+        print(f"{RED}Payload send error ({type(error).__name__}){RESET}")
         return None
 
 def init_camera():
@@ -152,12 +155,12 @@ def simulate_slots():
     return slots
 
 def build_payload(slot_states):
-    timestamp = datetime.now(datetime.UTC).isoformat()
+    timestamp = datetime.now(timezone.utc).isoformat()
     health = get_device_health()
     
     payload = {
         "parking_id": FACILITY_ID,
-        "device_id": DEVICE_CODE,
+        "device_id": DEVICE_ID,
         "timestamp": timestamp,
         "slots": slot_states,
         "confidence": 0.95,
@@ -187,13 +190,27 @@ def main():
     global USE_CAMERA, camera
     
     print(f"{YELLOW}SmartPark AI Agent Starting...{RESET}")
-    print(f"Server: {SERVER_URL}")
+    server_host = urlsplit(SERVER_URL).hostname or "unconfigured"
+    parsed_server_url = urlsplit(SERVER_URL)
+    server_scheme = parsed_server_url.scheme
+    print(f"Server host: {server_host}")
     print(f"Facility: {FACILITY_ID}")
-    print(f"Device: {DEVICE_CODE}")
+    print(f"Device: {DEVICE_ID or 'unconfigured'}")
     print(f"Mode: {'Camera' if USE_CAMERA else 'Simulation'}")
 
-    if not DEVICE_API_KEY:
-        print(f"{RED}BAYSIGNAL_DEVICE_API_KEY must be configured before the agent can send data.{RESET}")
+    if not all((DEVICE_ID, DEVICE_CREDENTIAL_ID, DEVICE_PRIVATE_KEY, FACILITY_ID)):
+        print(f"{RED}Configure BAYSIGNAL_DEVICE_ID, BAYSIGNAL_DEVICE_CREDENTIAL_ID, BAYSIGNAL_DEVICE_PRIVATE_KEY, and BAYSIGNAL_FACILITY_ID.{RESET}")
+        return
+    if server_scheme != "https" and server_host not in {"localhost", "127.0.0.1", "::1"}:
+        print(f"{RED}Use HTTPS for non-local BaySignal servers.{RESET}")
+        return
+    if parsed_server_url.username or parsed_server_url.password or parsed_server_url.query or parsed_server_url.fragment or parsed_server_url.path not in ("", "/"):
+        print(f"{RED}BAYSIGNAL_SERVER_URL must be a base URL without credentials, path, or query values.{RESET}")
+        return
+    try:
+        signed_request_headers(DEVICE_ID, DEVICE_CREDENTIAL_ID, DEVICE_PRIVATE_KEY, "POST", "/api/simulation/pi-payload", b"{}")
+    except Exception:
+        print(f"{RED}The configured device private key is invalid.{RESET}")
         return
     
     if USE_CAMERA:

@@ -1,13 +1,5 @@
 import 'dotenv/config'
 
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception', err)
-})
-
-process.on('unhandledRejection', (err) => {
-  console.error('Unhandled promise rejection', err)
-})
-
 import cors from 'cors'
 import express from 'express'
 import helmet from 'helmet'
@@ -30,6 +22,10 @@ import { generalRateLimit } from './middleware/rateLimiter.js'
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js'
 import { prisma } from './db.js'
 import { installSocketAccess } from './socketAccess.js'
+import { logProcessError } from './safeLogging.js'
+
+process.on('uncaughtException', (err) => logProcessError('uncaught_exception', err))
+process.on('unhandledRejection', (err) => logProcessError('unhandled_rejection', err))
 
 const app = express()
 app.set('trust proxy', config.trustProxy ? 1 : false)
@@ -59,7 +55,12 @@ app.use(
 )
 
 app.use(generalRateLimit)
-app.use(express.json({ limit: '50kb' }))
+app.use(express.json({
+  limit: '50kb',
+  verify: (req, res, buffer) => {
+    req.rawBody = Buffer.from(buffer)
+  }
+}))
 
 app.get('/health', (req, res) => {
   res.json({
@@ -100,7 +101,7 @@ async function startServer() {
 }
 
 startServer().catch((error) => {
-  console.error('Fatal startup error:', error.message)
+  logProcessError('fatal_startup_error', error)
   process.exit(1)
 })
 
