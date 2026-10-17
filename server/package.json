@@ -10,6 +10,7 @@
     "test:unit": "node --test test/*.test.js",
     "test:postgres:migrations": "node scripts/test-postgres-migrations.js",
     "test:postgres:integration": "node scripts/run-postgres-integration.js",
+    "tenant:dry-run": "node scripts/onboarding-dry-run.js",
     "admin:bootstrap-platform": "node scripts/bootstrap-platform-admin.js",
     "db:seed": "node prisma/seed.js",
     "test": "node --test",

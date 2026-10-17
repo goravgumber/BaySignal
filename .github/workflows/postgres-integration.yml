@@ -9,6 +9,7 @@ on:
     branches:
       - feature/baysignal-production-implementation
       - feature/device-auth-hardening
+      - feature/controlled-pilot-preparation
   workflow_dispatch:
 
 permissions:
