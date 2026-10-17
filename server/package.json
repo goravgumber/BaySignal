@@ -7,8 +7,12 @@
     "dev": "nodemon src/index.js",
     "start": "node src/index.js",
     "db:migrate": "prisma migrate deploy",
-    "db:push": "prisma db push",
+    "test:unit": "node --test test/*.test.js",
+    "test:postgres:migrations": "node scripts/test-postgres-migrations.js",
+    "test:postgres:integration": "node scripts/run-postgres-integration.js",
+    "admin:bootstrap-platform": "node scripts/bootstrap-platform-admin.js",
     "db:seed": "node prisma/seed.js",
+    "test": "node --test",
     "db:studio": "prisma studio"
   },
   "dependencies": {
@@ -27,6 +31,10 @@
   },
   "devDependencies": {
     "nodemon": "^3.1.0",
-    "prisma": "^5.0.0"
+    "prisma": "^5.0.0",
+    "socket.io-client": "^4.7.4"
+  },
+  "overrides": {
+    "qs": "6.16.1"
   }
 }

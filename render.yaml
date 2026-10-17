@@ -3,7 +3,7 @@ services:
     name: smartpark-server
     env: node
     rootDir: server
-    buildCommand: npm ci && npx prisma generate && npx prisma migrate deploy
+    buildCommand: npm ci && npx prisma generate
     startCommand: npm run start
     healthCheckPath: /health
     autoDeploy: true

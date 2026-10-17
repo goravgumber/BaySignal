@@ -5,11 +5,11 @@ export default {
     extend: {
       colors: {
         brand: {
-          cyan: '#00E5FF',
-          green: '#00FF88',
-          amber: '#FFB300',
-          red: '#FF3D57',
-          violet: '#7B61FF'
+          cyan: '#2563EB',
+          green: '#16A34A',
+          amber: '#D97706',
+          red: '#DC2626',
+          violet: '#7C3AED'
         },
         dark: {
           base: '#050B18',
@@ -19,7 +19,7 @@ export default {
         }
       },
       fontFamily: {
-        orbitron: ['Orbitron', 'sans-serif'],
+        orbitron: ['Inter', 'system-ui', 'sans-serif'],
         mono: ['JetBrains Mono', 'monospace']
       },
       animation: {

@@ -14,9 +14,8 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
 
-SERVER_URL = "http://localhost:4000"
-EMAIL = "admin@smartpark.ai"
-PASSWORD = "Admin@123"
+SERVER_URL = os.environ.get("BAYSIGNAL_SERVER_URL", "http://localhost:4000").rstrip("/")
+DEVICE_API_KEY = os.environ.get("BAYSIGNAL_DEVICE_API_KEY", "")
 FACILITY_ID = "348efc36-7857-4569-a402-730186287dda"
 DEVICE_CODE = "RAPI-01"
 SEND_INTERVAL_SECONDS = 3
@@ -36,7 +35,6 @@ RESET = "\033[0m"
 YELLOW = "\033[93m"
 
 lock = Lock()
-token = None
 slots = {}
 slot_changes = {}
 camera = None
@@ -72,30 +70,10 @@ def get_device_health():
         "status": "ONLINE"
     }
 
-def login():
-    global token
-    try:
-        response = requests.post(
-            f"{SERVER_URL}/api/auth/login",
-            json={"email": EMAIL, "password": PASSWORD},
-            timeout=10
-        )
-        if response.status_code == 200:
-            token = response.json().get("data", {}).get("token")
-            if token:
-                print(f"{GREEN}Authenticated successfully{RESET}")
-                return True
-        print(f"{RED}Login failed: {response.status_code} - {response.text}{RESET}")
-        return False
-    except Exception as e:
-        print(f"{RED}Login error: {e}{RESET}")
-        return False
-
-def send_payload(payload, retry=False):
-    global token
+def send_payload(payload):
     try:
         headers = {
-            "Authorization": f"Bearer {token}",
+            "X-Device-Key": DEVICE_API_KEY,
             "Content-Type": "application/json"
         }
         response = requests.post(
@@ -104,10 +82,6 @@ def send_payload(payload, retry=False):
             headers=headers,
             timeout=10
         )
-        if response.status_code == 401 and not retry:
-            print(f"{YELLOW}Token expired, re-authenticating...{RESET}")
-            if login():
-                return send_payload(payload, retry=True)
         return response.status_code
     except Exception as e:
         print(f"{RED}Payload send error: {e}{RESET}")
@@ -217,15 +191,15 @@ def main():
     print(f"Facility: {FACILITY_ID}")
     print(f"Device: {DEVICE_CODE}")
     print(f"Mode: {'Camera' if USE_CAMERA else 'Simulation'}")
+
+    if not DEVICE_API_KEY:
+        print(f"{RED}BAYSIGNAL_DEVICE_API_KEY must be configured before the agent can send data.{RESET}")
+        return
     
     if USE_CAMERA:
         if not init_camera():
             print(f"{YELLOW}Falling back to simulation mode{RESET}")
             USE_CAMERA = False
-    
-    if not login():
-        print(f"{RED}Cannot start without authentication{RESET}")
-        return
     
     print(f"{YELLOW}Starting data collection... (Press Ctrl+C to stop){RESET}")
     

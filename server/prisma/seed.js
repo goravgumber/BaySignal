@@ -1,5 +1,6 @@
 import bcrypt from 'bcryptjs'
 import { prisma } from '../src/db.js'
+import { validateSeedEnvironment } from '../src/seedPolicy.js'
 
 function shuffle(array) {
   const arr = [...array]
@@ -17,6 +18,7 @@ function getVehicleNumber(index) {
 }
 
 async function main() {
+  const seedPassword = validateSeedEnvironment()
   const existingUsers = await prisma.user.count()
   if (existingUsers > 0) {
     console.log('✅ Database already seeded. Skipping seed.')
@@ -26,7 +28,7 @@ async function main() {
   console.log('🌱 Seeding database...')
 
   console.log('✅ Creating users...')
-  const hashedPassword = await bcrypt.hash('Admin@123', 10)
+  const hashedPassword = await bcrypt.hash(seedPassword, 10)
   const [adminUser, ownerUser, driverUser] = await Promise.all([
     prisma.user.create({
       data: {

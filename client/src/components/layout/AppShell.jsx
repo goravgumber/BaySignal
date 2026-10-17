@@ -5,13 +5,12 @@ import Header from './Header'
 import VoiceAssistant from '../voice/VoiceAssistant'
 
 const titleMap = {
-  '/dashboard/map': 'Map Overview',
+  '/dashboard/map': 'Parking operations',
   '/dashboard/analytics': 'Analytics',
   '/dashboard/environment': 'Environment',
   '/dashboard/reservations': 'Reservations',
   '/dashboard/revenue': 'Revenue',
   '/dashboard/alerts': 'Alerts',
-  '/dashboard/ai': 'AI Predictions',
   '/dashboard/admin': 'Admin Panel'
 }
 
@@ -25,12 +24,6 @@ export default function AppShell() {
     return ['Dashboard', ...parts.slice(1).map((part) => part[0].toUpperCase() + part.slice(1))].join(' / ')
   }, [location.pathname])
 
-  const recentAlerts = [
-    { id: 1, title: 'Zone B sensor overheating', time: '2 min ago' },
-    { id: 2, title: 'RAPI-03 gateway offline', time: '9 min ago' },
-    { id: 3, title: 'VIP camera frame drop', time: '14 min ago' }
-  ]
-
   return (
     <div className="min-h-screen">
       <div className="flex h-screen">
@@ -40,8 +33,6 @@ export default function AppShell() {
           <Header
             title={title}
             breadcrumb={breadcrumb}
-            unreadCount={6}
-            recentAlerts={recentAlerts}
             onMenuToggle={() => setMobileOpen((value) => !value)}
           />
 

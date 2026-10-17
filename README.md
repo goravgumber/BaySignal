@@ -1,6 +1,6 @@
-# SmartPark AI
+# BaySignal (formerly SmartPark AI)
 
-Production-ready hackathon prototype for intelligent urban parking operations with live occupancy, reservations, analytics, voice queries, and Raspberry Pi simulation.
+Parking operations prototype for facility-scoped access, reservations, device health, and evidence-aware bay state. Reports without validated source data show as unavailable. Hardware gate/ANPR integration is not implemented.
 
 ## Live Demo Links
 
@@ -10,13 +10,13 @@ Production-ready hackathon prototype for intelligent urban parking operations wi
 
 ## Project Overview
 
-SmartPark AI is a full-stack realtime platform built for smart city parking workflows:
+BaySignal is a full-stack prototype for parking workflows:
 
 - Live facility map with realtime slot updates
 - Reservation lifecycle with atomic slot transitions
-- Analytics and environmental impact dashboards
-- Voice assistant (Hindi + English) with API-backed responses
-- Raspberry Pi payload simulator for realistic demo telemetry
+- Analytics and environmental reports remain unavailable until their source data and calculations are validated
+- Voice answers for live facility data remain unavailable until tenant-scoped data sources are configured
+- Explicit simulator for test/demo bay changes, recorded as simulation evidence
 
 ## Features
 
@@ -24,7 +24,7 @@ SmartPark AI is a full-stack realtime platform built for smart city parking work
 - Realtime event pipeline (MQTT -> Backend -> Socket.IO -> Frontend)
 - Reservation conflict protection and transaction-safe updates
 - Alerts and device monitoring
-- Sectioned architecture for demo today and production scaling tomorrow
+- Tenant-scoped access with unassigned legacy facilities inaccessible by default
 
 ## AMD Technology Integration
 
@@ -81,9 +81,9 @@ sequenceDiagram
   participant Socket as Socket.IO
   participant Client as MapOverviewPage
 
-  Device->>Server: slot payload / simulation tick
-  Server->>Server: validate + update slots (DB)
-  Server->>Socket: emit slot:updated + occupancy:live
+  Device->>Server: authenticated device report
+  Server->>Server: store device health and untrusted observation evidence
+  Server->>Socket: emit configured health or explicit simulation updates
   Socket-->>Client: realtime event
   Client->>Client: patch slot state + refresh summary
 ```
@@ -130,8 +130,8 @@ cd server
 cp .env.example .env
 npm install
 npx prisma generate
-npx prisma db push
-npm run db:seed
+npx prisma db push # local development database only; verify DATABASE_URL before running
+npm run db:seed # requires explicit local demo-seed opt-in and a locally supplied seed password
 npm run dev
 ```
 
@@ -173,20 +173,16 @@ Frontend runtime requirements:
 
 ## Demo Credentials
 
-- Admin: `admin@smartpark.ai` / `Admin@123`
-- Owner: `owner@smartpark.ai` / `Admin@123`
-- Driver: `driver@smartpark.ai` / `Admin@123`
+Demo passwords were removed from the repository. Configure credentials locally and rotate any previously disclosed demo account credentials before continued use.
 
 ## Hackathon Judge Flow
 
-1. Login as Admin and open Map Overview.
-2. Start Raspberry Pi Simulator from top-right panel.
-3. Show live slot color transitions and occupancy summary updates.
-4. Create reservation from available slot modal.
-5. Open Analytics and Revenue pages to show KPIs and trends.
-6. Open Environment dashboard for measurable impact metrics.
-7. Trigger Voice Assistant query in Hindi/English.
-8. Show AMD architecture docs for scalability narrative.
+1. Sign in with an explicitly provisioned test account and open the facility map.
+2. Use the simulator only in a configured test/demo environment; its changes are labeled as simulation.
+3. Review reservation holds separately from recorded bay occupancy.
+4. Open analytics and revenue reports to see their unavailable state while sources remain unvalidated.
+5. Use the visit ledger only when verified gate evidence has been supplied by a trusted integration.
+6. Review tenant access and the migration handoff before discussing operational deployment.
 
 ## Screenshots (Placeholders)
 

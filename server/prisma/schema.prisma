@@ -15,12 +15,83 @@ model User {
   role         Role          @default(DRIVER)
   createdAt    DateTime      @default(now())
   reservations Reservation[]
+  memberships   OrganizationMembership[]
+  auditEvents   AuditEvent[]
+  resolvedDiscrepancies Discrepancy[]
 }
 
 enum Role {
   DRIVER
   OWNER
   ADMIN
+  PLATFORM_ADMIN
+}
+
+enum MembershipRole {
+  ORG_ADMIN
+  FACILITY_MANAGER
+  ATTENDANT
+  FINANCE
+  DEVICE_TECHNICIAN
+  DRIVER
+  VIEWER
+}
+
+enum MembershipStatus {
+  INVITED
+  ACTIVE
+  SUSPENDED
+}
+
+enum FacilityAccessRole {
+  FACILITY_MANAGER
+  ATTENDANT
+  FINANCE
+  DEVICE_TECHNICIAN
+  DRIVER
+  VIEWER
+}
+
+enum PresenceStatus {
+  ACTIVE
+  EXITED
+  REVIEW
+}
+
+enum GateDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum EventValidation {
+  VERIFIED
+  REVIEW_REQUIRED
+  REJECTED
+}
+
+enum BayEvidenceSource {
+  DEVICE_REPORT
+  BAY_SENSOR
+  OVERHEAD_CAMERA
+  AISLE_CAMERA
+  INBOUND_ANPR
+  OUTBOUND_ANPR
+  ATTENDANT
+  RESERVATION_CONTEXT
+  SIMULATION
+}
+
+enum EvidenceResult {
+  OCCUPIED
+  VACANT
+  UNKNOWN
+  CONFLICTING
+}
+
+enum DiscrepancyStatus {
+  OPEN
+  RESOLVED
+  DISMISSED
 }
 
 model Facility {
@@ -29,11 +100,67 @@ model Facility {
   address    String
   city       String
   totalSlots Int      @default(120)
+  allowPublicReservations Boolean @default(false)
   lat        Float
   lng        Float
   createdAt  DateTime @default(now())
+  organizationId String?
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Restrict)
   zones      Zone[]
   devices    Device[]
+  visits     FacilityVisit[]
+  gateEvents GateEvent[]
+  observations BayObservation[]
+  discrepancies Discrepancy[]
+  auditEvents AuditEvent[]
+  facilityAccess FacilityAccess[]
+
+  @@index([organizationId])
+}
+
+model Organization {
+  id           String   @id @default(uuid())
+  name         String
+  slug         String   @unique
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  facilities   Facility[]
+  memberships  OrganizationMembership[]
+  visits       FacilityVisit[]
+  gateEvents   GateEvent[]
+  observations BayObservation[]
+  discrepancies Discrepancy[]
+  auditEvents  AuditEvent[]
+}
+
+model OrganizationMembership {
+  id             String           @id @default(uuid())
+  organizationId String
+  userId         String
+  role           MembershipRole
+  status         MembershipStatus @default(INVITED)
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  user           User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  facilityAccess FacilityAccess[]
+
+  @@unique([organizationId, userId])
+  @@index([userId, status])
+  @@index([organizationId, role, status])
+}
+
+model FacilityAccess {
+  id           String             @id @default(uuid())
+  membershipId String
+  facilityId   String
+  role         FacilityAccessRole
+  createdAt    DateTime           @default(now())
+  membership   OrganizationMembership @relation(fields: [membershipId], references: [id], onDelete: Restrict)
+  facility     Facility           @relation(fields: [facilityId], references: [id], onDelete: Restrict)
+
+  @@unique([membershipId, facilityId])
+  @@index([facilityId, role])
 }
 
 model Zone {
@@ -56,6 +183,9 @@ model ParkingSlot {
   slotType      SlotType      @default(STANDARD)
   updatedAt     DateTime      @updatedAt
   reservations  Reservation[]
+  observations  BayObservation[]
+  visits        FacilityVisit[]
+  discrepancies Discrepancy[]
 }
 
 enum SlotStatus {
@@ -90,6 +220,10 @@ model Reservation {
   startTime       DateTime
   endTime         DateTime
   createdAt       DateTime          @default(now())
+  facilityVisits  FacilityVisit[]
+
+  @@index([slotId, status, startTime, endTime])
+  @@index([userId, createdAt])
 }
 
 enum ReservationStatus {
@@ -111,6 +245,8 @@ model Device {
   temperature Float        @default(0)
   lastPingAt  DateTime     @default(now())
   ipAddress   String       @default("")
+  gateEvents GateEvent[]
+  observations BayObservation[]
 }
 
 enum DeviceStatus {
@@ -133,4 +269,159 @@ enum AlertSeverity {
   CRITICAL
   WARNING
   INFO
+}
+
+// This is a keyed, non-reversible vehicle reference, never a raw plate or image.
+model FacilityVisit {
+  id                 String         @id @default(uuid())
+  organizationId     String
+  facilityId         String
+  vehicleReference   String?
+  inboundEventId     String         @unique
+  outboundEventId    String?        @unique
+  inboundAt          DateTime
+  exitedAt           DateTime?
+  status             PresenceStatus @default(ACTIVE)
+  provenance         String
+  currentBayId       String?
+  reservationId      String?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+  organization       Organization   @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  facility           Facility       @relation(fields: [facilityId], references: [id], onDelete: Restrict)
+  currentBay         ParkingSlot?   @relation(fields: [currentBayId], references: [id], onDelete: Restrict)
+  reservation        Reservation?   @relation(fields: [reservationId], references: [id], onDelete: Restrict)
+  inboundEvent       GateEvent      @relation("VisitInbound", fields: [inboundEventId], references: [id], onDelete: Restrict)
+  outboundEvent      GateEvent?     @relation("VisitOutbound", fields: [outboundEventId], references: [id], onDelete: Restrict)
+  gateEvents         GateEvent[]    @relation("VisitEvents")
+  observations       BayObservation[]
+  discrepancies      Discrepancy[]
+
+  @@index([facilityId, status, inboundAt])
+  @@index([organizationId, status])
+  @@index([vehicleReference, facilityId, inboundAt])
+  @@index([currentBayId])
+}
+
+model GateEvent {
+  id               String          @id @default(uuid())
+  organizationId   String
+  facilityId       String
+  deviceId         String?
+  sourceEventId    String
+  deduplicationKey String          @unique
+  direction        GateDirection
+  validation       EventValidation @default(REVIEW_REQUIRED)
+  vehicleReference String?
+  eventAt          DateTime
+  receivedAt       DateTime        @default(now())
+  provenance       String
+  payloadDigest    String?
+  visitId          String?
+  processedAt      DateTime?
+  organization     Organization    @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  facility         Facility        @relation(fields: [facilityId], references: [id], onDelete: Restrict)
+  device           Device?         @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  visit            FacilityVisit?  @relation("VisitEvents", fields: [visitId], references: [id], onDelete: Restrict)
+  openedVisit      FacilityVisit?  @relation("VisitInbound")
+  closedVisit      FacilityVisit?  @relation("VisitOutbound")
+  observations     BayObservation[]
+  discrepancy     Discrepancy?
+
+  @@unique([facilityId, sourceEventId])
+  @@index([facilityId, eventAt, direction])
+  @@index([organizationId, eventAt])
+  @@index([visitId])
+}
+
+model BayObservation {
+  id                String            @id @default(uuid())
+  organizationId    String
+  facilityId        String
+  slotId            String?
+  visitId           String?
+  deviceId          String?
+  gateEventId       String?
+  source            BayEvidenceSource
+  sourceReference   String?
+  deduplicationKey  String            @unique
+  result            EvidenceResult
+  vehicleReference  String?
+  confidence        Float?
+  observedAt        DateTime
+  receivedAt        DateTime          @default(now())
+  freshnessSeconds  Int?
+  details           Json?
+  organization      Organization      @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  facility          Facility          @relation(fields: [facilityId], references: [id], onDelete: Restrict)
+  slot              ParkingSlot?      @relation(fields: [slotId], references: [id], onDelete: Restrict)
+  visit             FacilityVisit?    @relation(fields: [visitId], references: [id], onDelete: Restrict)
+  device            Device?           @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  gateEvent         GateEvent?        @relation(fields: [gateEventId], references: [id], onDelete: Restrict)
+  discrepancyLinks  DiscrepancyEvidence[]
+
+  @@index([facilityId, slotId, observedAt])
+  @@index([organizationId, receivedAt])
+  @@index([visitId, observedAt])
+  @@index([source, observedAt])
+}
+
+model Discrepancy {
+  id             String            @id @default(uuid())
+  organizationId String
+  facilityId     String
+  slotId         String?
+  visitId        String?
+  gateEventId    String?           @unique
+  status         DiscrepancyStatus @default(OPEN)
+  kind           String
+  summary        String
+  openedAt       DateTime          @default(now())
+  resolvedAt     DateTime?
+  resolvedById   String?
+  resolution     String?
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  facility       Facility     @relation(fields: [facilityId], references: [id], onDelete: Restrict)
+  slot           ParkingSlot? @relation(fields: [slotId], references: [id], onDelete: Restrict)
+  visit          FacilityVisit? @relation(fields: [visitId], references: [id], onDelete: Restrict)
+  resolvedBy     User?          @relation(fields: [resolvedById], references: [id], onDelete: Restrict)
+  gateEvent      GateEvent?     @relation(fields: [gateEventId], references: [id], onDelete: Restrict)
+  evidence       DiscrepancyEvidence[]
+
+  @@index([facilityId, status, openedAt])
+  @@index([organizationId, status])
+}
+
+model DiscrepancyEvidence {
+  discrepancyId String
+  observationId String
+  linkedAt      DateTime       @default(now())
+  discrepancy   Discrepancy   @relation(fields: [discrepancyId], references: [id], onDelete: Restrict)
+  observation   BayObservation @relation(fields: [observationId], references: [id], onDelete: Restrict)
+
+  @@id([discrepancyId, observationId])
+  @@index([observationId])
+}
+
+model AuditEvent {
+  id             String   @id @default(uuid())
+  organizationId String?
+  facilityId     String?
+  actorUserId    String?
+  actorSystem    String?
+  action         String
+  resourceType   String
+  resourceId     String?
+  reason         String?
+  beforeState    Json?
+  afterState     Json?
+  occurredAt     DateTime @default(now())
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  facility       Facility? @relation(fields: [facilityId], references: [id], onDelete: Restrict)
+  actorUser      User? @relation(fields: [actorUserId], references: [id], onDelete: Restrict)
+
+  @@index([organizationId, occurredAt])
+  @@index([facilityId, occurredAt])
+  @@index([actorUserId, occurredAt])
+  @@index([resourceType, resourceId, occurredAt])
 }

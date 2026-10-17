@@ -1,48 +1,70 @@
 import { Suspense, lazy } from 'react'
-import { Navigate, Outlet, Route, Routes } from 'react-router-dom'
+import { Navigate, Outlet, Route, Routes, useLocation } from 'react-router-dom'
 import { AuthProvider, useAuth } from './store/auth'
 
 const LoginPage = lazy(() => import('./pages/LoginPage'))
 const AppShell = lazy(() => import('./components/layout/AppShell'))
 const MapOverviewPage = lazy(() => import('./pages/MapOverviewPage'))
-const AnalyticsPage = lazy(() => import('./pages/AnalyticsPage'))
-const EnvironmentPage = lazy(() => import('./pages/EnvironmentPage'))
-const RevenuePage = lazy(() => import('./pages/RevenuePage'))
-const AIPredictionsPage = lazy(() => import('./pages/AIPredictionsPage'))
 const AdminPage = lazy(() => import('./pages/AdminPage'))
 const AlertsPage = lazy(() => import('./pages/AlertsPage'))
 const ReservationsPage = lazy(() => import('./pages/ReservationsPage'))
 
+function RouteLoading() {
+  return <div className="flex min-h-screen items-center justify-center bg-slate-50 text-sm text-slate-600">Loading your workspace…</div>
+}
+
 function ProtectedRoute() {
-  const token = localStorage.getItem('smartpark_token')
-  const { loading } = useAuth()
+  const { loading, isAuthenticated } = useAuth()
 
-  if (!token) {
+  if (loading) return <RouteLoading />
+  if (!isAuthenticated) {
     return <Navigate to="/login" replace />
-  }
-
-  if (loading) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-dark-base">
-        <div className="glass-card px-6 py-4 font-mono text-brand-cyan">Verifying command token...</div>
-      </div>
-    )
   }
 
   return <Outlet />
 }
 
-function HomeRedirect() {
-  const token = localStorage.getItem('smartpark_token')
-  return <Navigate to={token ? '/dashboard/map' : '/login'} replace />
+function RequirePermission({ permission, allowDriver = false, children }) {
+  const { user, loading } = useAuth()
+  const location = useLocation()
+  if (loading) return <RouteLoading />
+  const allowed = user?.permissions?.includes(permission) || (allowDriver && user?.role === 'DRIVER')
+  if (!allowed) {
+    return (
+      <main className="mx-auto max-w-xl px-6 py-20 text-center">
+        <h1 className="text-xl font-semibold text-slate-900">Access not available</h1>
+        <p className="mt-2 text-sm text-slate-600">Your account does not have permission to open this page.</p>
+        <p className="mt-1 text-xs text-slate-500">Requested page: {location.pathname}</p>
+      </main>
+    )
+  }
+  return children
 }
 
-function RouteLoading() {
-  return (
-    <div className="flex min-h-screen items-center justify-center bg-dark-base">
-      <div className="glass-card px-6 py-4 font-mono text-brand-cyan">Loading module...</div>
-    </div>
-  )
+function HomeRedirect() {
+  const { loading, isAuthenticated, user } = useAuth()
+  if (loading) return <RouteLoading />
+  const permissions = user?.permissions || []
+  const defaultPath = permissions.includes('operations_read')
+    ? '/dashboard/map'
+    : permissions.includes('reservations_read') || user?.role === 'DRIVER'
+      ? '/dashboard/reservations'
+      : permissions.includes('alerts_read')
+        ? '/dashboard/alerts'
+        : permissions.includes('devices_read')
+          ? '/dashboard/admin'
+          : permissions.includes('finance_read')
+            ? '/dashboard/revenue'
+            : '/dashboard/analytics'
+  return <Navigate to={isAuthenticated ? defaultPath : '/login'} replace />
+}
+
+function DataUnavailablePage({ feature }) {
+  return <main className="mx-auto max-w-2xl rounded-xl border border-slate-200 bg-white p-6 sm:p-8">
+    <p className="text-xs font-semibold uppercase tracking-wider text-blue-700">{feature}</p>
+    <h1 className="mt-2 text-xl font-semibold text-slate-900">Data source not configured</h1>
+    <p className="mt-2 text-sm leading-6 text-slate-600">This view needs validated production data and a documented calculation method. No sample or estimated values are shown here.</p>
+  </main>
 }
 
 export default function App() {
@@ -56,14 +78,14 @@ export default function App() {
           <Route element={<ProtectedRoute />}>
             <Route path="/dashboard" element={<AppShell />}>
               <Route index element={<Navigate to="map" replace />} />
-              <Route path="map" element={<MapOverviewPage />} />
-              <Route path="analytics" element={<AnalyticsPage />} />
-              <Route path="environment" element={<EnvironmentPage />} />
-              <Route path="reservations" element={<ReservationsPage />} />
-              <Route path="revenue" element={<RevenuePage />} />
-              <Route path="alerts" element={<AlertsPage />} />
-              <Route path="ai" element={<AIPredictionsPage />} />
-              <Route path="admin" element={<AdminPage />} />
+              <Route path="map" element={<RequirePermission permission="operations_read"><MapOverviewPage /></RequirePermission>} />
+              <Route path="analytics" element={<RequirePermission permission="analytics_read"><DataUnavailablePage feature="Analytics" /></RequirePermission>} />
+              <Route path="environment" element={<RequirePermission permission="analytics_read"><DataUnavailablePage feature="Environmental report" /></RequirePermission>} />
+              <Route path="reservations" element={<RequirePermission permission="reservations_read" allowDriver><ReservationsPage /></RequirePermission>} />
+              <Route path="revenue" element={<RequirePermission permission="finance_read"><DataUnavailablePage feature="Revenue" /></RequirePermission>} />
+              <Route path="alerts" element={<RequirePermission permission="alerts_read"><AlertsPage /></RequirePermission>} />
+              <Route path="ai" element={<RequirePermission permission="analytics_read"><DataUnavailablePage feature="Forecast" /></RequirePermission>} />
+              <Route path="admin" element={<RequirePermission permission="devices_read"><AdminPage /></RequirePermission>} />
             </Route>
           </Route>
 
