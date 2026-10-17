@@ -240,6 +240,7 @@ model Device {
   facility    Facility     @relation(fields: [facilityId], references: [id])
   zone        String
   status      DeviceStatus @default(ONLINE)
+  ingestionEnabled Boolean @default(true)
   cpuPercent  Float        @default(0)
   ramPercent  Float        @default(0)
   temperature Float        @default(0)
@@ -247,6 +248,31 @@ model Device {
   ipAddress   String       @default("")
   gateEvents GateEvent[]
   observations BayObservation[]
+  credentials DeviceCredential[]
+  requests DeviceRequest[]
+}
+
+model DeviceCredential {
+  id         String   @id @default(uuid())
+  deviceId   String
+  publicKey  String
+  createdAt  DateTime @default(now())
+  revokedAt  DateTime?
+  device     Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, revokedAt])
+}
+
+model DeviceRequest {
+  id        String   @id @default(uuid())
+  deviceId  String
+  requestId String
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+  device    Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@unique([deviceId, requestId])
+  @@index([expiresAt])
 }
 
 enum DeviceStatus {

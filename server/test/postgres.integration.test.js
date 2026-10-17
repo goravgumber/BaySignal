@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash, createPrivateKey, randomUUID, sign as signEd25519 } from 'node:crypto'
 import { createServer } from 'node:http'
 
 const enabled = process.env.BAYSIGNAL_PG_INTEGRATION === '1'
@@ -13,9 +13,10 @@ test('PostgreSQL constraints, audited services, and tenant routes', { skip: !ena
   assert.equal(databaseTarget.pathname, '/baysignal_test_integration', 'integration tests require the named disposable database')
   assert.equal(databaseTarget.search, '', 'integration tests refuse database URL overrides')
   assert.equal(databaseTarget.hash, '', 'integration tests refuse database URL fragments')
-  const [{ PrismaClient }, jwt, expressModule, operationsModule, reservationsModule, authModule, { prisma: routePrisma }, { config }, { reconcileSlotEvidence }, { processVerifiedGateEvent }, socketServerModule, socketClientModule, socketAccessModule] = await Promise.all([
+  const [{ PrismaClient }, jwt, expressModule, operationsModule, reservationsModule, authModule, devicesModule, simulationModule, errorHandlerModule, { prisma: routePrisma }, { config }, { reconcileSlotEvidence }, { processVerifiedGateEvent }, socketServerModule, socketClientModule, socketAccessModule] = await Promise.all([
     import('@prisma/client'), import('jsonwebtoken'), import('express'), import('../src/routes/operations.js'),
-    import('../src/routes/reservations.js'), import('../src/routes/auth.js'), import('../src/db.js'), import('../src/config.js'),
+    import('../src/routes/reservations.js'), import('../src/routes/auth.js'), import('../src/routes/devices.js'),
+    import('../src/routes/simulation.js'), import('../src/middleware/errorHandler.js'), import('../src/db.js'), import('../src/config.js'),
     import('../src/services/reconcileEvidence.js'), import('../src/services/gateEvents.js'), import('socket.io'),
     import('socket.io-client'), import('../src/socketAccess.js')
   ])
@@ -26,14 +27,19 @@ test('PostgreSQL constraints, audited services, and tenant routes', { skip: !ena
   const operationsRoutes = operationsModule.default
   const reservationRoutes = reservationsModule.default
   const authRoutes = authModule.default
+  const devicesRoutes = devicesModule.default
+  const simulationRoutes = simulationModule.default
+  const { errorHandler } = errorHandlerModule
   assert.ok(config.jwtSecret.length >= 32, 'integration test JWT_SECRET must be test-only and at least 32 characters')
   const prisma = new PrismaClient()
   const app = express()
-  app.use(express.json())
+  app.use(express.json({ verify: (req, res, buffer) => { req.rawBody = Buffer.from(buffer) } }))
   app.use('/api/auth', authRoutes)
   app.use('/api/reservations', reservationRoutes)
   app.use('/api/operations', operationsRoutes)
-  app.use((error, req, res, next) => res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : 'Internal error' }))
+  app.use('/api/devices', devicesRoutes)
+  app.use('/api/simulation', simulationRoutes)
+  app.use(errorHandler)
   const server = createServer(app)
   const socketServer = new Server(server, { serveClient: false })
   installSocketAccess(socketServer, { prisma, jwtSecret: config.jwtSecret })
@@ -79,6 +85,147 @@ test('PostgreSQL constraints, audited services, and tenant routes', { skip: !ena
     const financeToken = tokenFor(finance)
     const foreignToken = tokenFor(foreignManager)
     const driverToken = tokenFor(driver)
+
+    const deviceHeaders = ({ method = 'PUT', path, deviceId, credential, body, requestId = randomUUID(), timestamp = Math.floor(Date.now() / 1000) }) => {
+      const rawBody = Buffer.from(body)
+      const timestampText = String(timestamp)
+      const bodyHash = createHash('sha256').update(rawBody).digest('hex')
+      const canonical = `${method}\n${path}\n${timestampText}\n${requestId}\n${bodyHash}`
+      const signature = signEd25519(null, Buffer.from(canonical), createPrivateKey({ key: Buffer.from(credential.privateKey, 'base64url'), format: 'der', type: 'pkcs8' })).toString('base64url')
+      return {
+        'x-device-credential-id': credential.credential.id,
+        'x-device-id': deviceId,
+        'x-device-timestamp': timestampText,
+        'x-device-request-id': requestId,
+        'x-device-signature': signature
+      }
+    }
+    const signDeviceCall = (options) => request(options.path, null, {
+      method: options.method || 'PUT',
+      body: options.body,
+      headers: deviceHeaders(options)
+    })
+
+    await t.test('device credentials are scoped, signed, revocable, replay-safe, and transactional', async () => {
+      const deviceA = await prisma.device.create({ data: { deviceCode: `device-a-${unique}`, facilityId: facilityA.id, zone: 'A' } })
+      const deviceB = await prisma.device.create({ data: { deviceCode: `device-b-${unique}`, facilityId: facilityB.id, zone: 'B' } })
+      const issue = (device, token = managerToken) => request(`/api/devices/${device.id}/credentials`, token, {
+        method: 'POST', body: JSON.stringify({ reason: 'Register device for authenticated pilot ingestion' })
+      })
+      const issuedResponse = await issue(deviceA)
+      assert.equal(issuedResponse.status, 201)
+      assert.equal(issuedResponse.headers.get('cache-control'), 'no-store')
+      const issued = (await issuedResponse.json()).data
+      const storedCredential = await prisma.deviceCredential.findUnique({ where: { id: issued.credential.id } })
+      assert.equal(storedCredential.deviceId, deviceA.id)
+      assert.equal(storedCredential.publicKey.includes(issued.privateKey), false)
+      const issuedAudit = await prisma.auditEvent.findFirst({ where: { action: 'DEVICE_CREDENTIAL_ISSUED', resourceId: issued.credential.id } })
+      assert.ok(issuedAudit)
+      assert.equal(JSON.stringify(issuedAudit).includes(issued.privateKey), false)
+      const unauthorizedIssue = await issue(deviceA, foreignToken)
+      assert.equal(unauthorizedIssue.status, 404)
+
+      const body = JSON.stringify({ cpuPercent: 10, ramPercent: 20, temperature: 30 })
+      const heartbeatPath = `/api/devices/${deviceA.id}/heartbeat`
+      const legacyWithoutOptIn = await request(heartbeatPath, null, { method: 'PUT', body, headers: { 'x-device-key': 'legacy-key-does-not-enable-access' } })
+      assert.equal(legacyWithoutOptIn.status, 401)
+      const invalidCredential = { ...issued, credential: { ...issued.credential, id: randomUUID() } }
+      const unknown = await signDeviceCall({ path: heartbeatPath, deviceId: deviceA.id, credential: invalidCredential, body })
+      const unknownBody = await unknown.json()
+      assert.equal(unknown.status, 401)
+      assert.deepEqual(unknownBody, { success: false, error: 'Invalid device authentication.', code: 401 })
+
+      const tampered = JSON.stringify({ cpuPercent: 99, ramPercent: 20, temperature: 30 })
+      const tamperRequestId = randomUUID()
+      const tamperHeaders = deviceHeaders({ path: heartbeatPath, deviceId: deviceA.id, credential: issued, body, requestId: tamperRequestId })
+      const tamperedResponse = await request(heartbeatPath, null, { method: 'PUT', body: tampered, headers: tamperHeaders })
+      assert.equal(tamperedResponse.status, 401)
+      const signatureLastChar = tamperHeaders['x-device-signature'].slice(-1)
+      const alteredSignatureHeaders = { ...tamperHeaders, 'x-device-signature': `${tamperHeaders['x-device-signature'].slice(0, -1)}${signatureLastChar === 'A' ? 'B' : 'A'}` }
+      const alteredSignature = await request(heartbeatPath, null, { method: 'PUT', body, headers: alteredSignatureHeaders })
+      assert.equal(alteredSignature.status, 401)
+
+      const wrongDevice = await signDeviceCall({ path: `/api/devices/${deviceB.id}/heartbeat`, deviceId: deviceB.id, credential: issued, body })
+      assert.equal(wrongDevice.status, 401)
+
+      const piPath = '/api/simulation/pi-payload'
+      const piBody = JSON.stringify({ parking_id: facilityB.id, device_id: deviceA.id, timestamp: new Date().toISOString(), slots: {} })
+      const wrongFacility = await signDeviceCall({ method: 'POST', path: piPath, deviceId: deviceA.id, credential: issued, body: piBody })
+      assert.equal(wrongFacility.status, 401)
+      const validPiBody = JSON.stringify({ parking_id: facilityA.id, device_id: deviceA.id, timestamp: new Date().toISOString(), slots: {} })
+      const validPi = await signDeviceCall({ method: 'POST', path: piPath, deviceId: deviceA.id, credential: issued, body: validPiBody })
+      assert.equal(validPi.status, 200)
+      const stale = await signDeviceCall({ path: heartbeatPath, deviceId: deviceA.id, credential: issued, body, timestamp: Math.floor(Date.now() / 1000) - 301 })
+      assert.equal(stale.status, 401)
+      const future = await signDeviceCall({ path: heartbeatPath, deviceId: deviceA.id, credential: issued, body, timestamp: Math.floor(Date.now() / 1000) + 301 })
+      assert.equal(future.status, 401)
+      await prisma.device.update({ where: { id: deviceA.id }, data: { status: 'MAINTENANCE' } })
+      const maintenanceDenied = await signDeviceCall({ path: heartbeatPath, deviceId: deviceA.id, credential: issued, body })
+      assert.equal(maintenanceDenied.status, 401)
+      await prisma.device.update({ where: { id: deviceA.id }, data: { status: 'ONLINE', ingestionEnabled: false } })
+      const disabledDenied = await signDeviceCall({ path: heartbeatPath, deviceId: deviceA.id, credential: issued, body })
+      assert.equal(disabledDenied.status, 401)
+      await prisma.device.update({ where: { id: deviceA.id }, data: { ingestionEnabled: true } })
+
+      const replayId = randomUUID()
+      const accepted = await signDeviceCall({ path: heartbeatPath, deviceId: deviceA.id, credential: issued, body, requestId: replayId })
+      assert.equal(accepted.status, 200)
+      const replay = await signDeviceCall({ path: heartbeatPath, deviceId: deviceA.id, credential: issued, body, requestId: replayId })
+      assert.equal(replay.status, 409)
+      assert.equal(await prisma.deviceRequest.count({ where: { deviceId: deviceA.id, requestId: replayId } }), 1)
+
+      const concurrentId = randomUUID()
+      const concurrent = await Promise.all([
+        signDeviceCall({ path: heartbeatPath, deviceId: deviceA.id, credential: issued, body, requestId: concurrentId }),
+        signDeviceCall({ path: heartbeatPath, deviceId: deviceA.id, credential: issued, body, requestId: concurrentId })
+      ])
+      assert.deepEqual(concurrent.map((response) => response.status).sort(), [200, 409])
+      assert.equal(await prisma.deviceRequest.count({ where: { deviceId: deviceA.id, requestId: concurrentId } }), 1)
+
+      const initialDevice = await prisma.device.findUnique({ where: { id: deviceA.id } })
+      await prisma.$executeRawUnsafe(`CREATE FUNCTION "integration_force_device_failure"() RETURNS trigger AS $$ BEGIN IF NEW."cpuPercent" = 99 THEN RAISE EXCEPTION 'forced device failure'; END IF; RETURN NEW; END; $$ LANGUAGE plpgsql`)
+      await prisma.$executeRawUnsafe(`CREATE TRIGGER "integration_force_device_failure" BEFORE UPDATE ON "Device" FOR EACH ROW EXECUTE FUNCTION "integration_force_device_failure"()`)
+      const rollbackRequestId = randomUUID()
+      let errorLog = ''
+      const originalConsoleError = console.error
+      try {
+        console.error = (...parts) => { errorLog += parts.join(' ') }
+        const failed = await signDeviceCall({ path: heartbeatPath, deviceId: deviceA.id, credential: issued, body: tampered, requestId: rollbackRequestId })
+        assert.equal(failed.status, 500)
+        assert.equal((await failed.json()).error, 'Internal Server Error')
+        assert.equal(await prisma.deviceRequest.count({ where: { deviceId: deviceA.id, requestId: rollbackRequestId } }), 0)
+        assert.equal((await prisma.device.findUnique({ where: { id: deviceA.id } })).cpuPercent, initialDevice.cpuPercent)
+      } finally {
+        console.error = originalConsoleError
+        await prisma.$executeRawUnsafe(`DROP TRIGGER IF EXISTS "integration_force_device_failure" ON "Device"`)
+        await prisma.$executeRawUnsafe(`DROP FUNCTION IF EXISTS "integration_force_device_failure"()`)
+      }
+      assert.equal(errorLog.includes(issued.privateKey), false)
+      assert.equal(errorLog.includes(issued.credential.id), false)
+      assert.equal(errorLog.includes(tampered), false)
+      const retryAfterRollback = await signDeviceCall({ path: heartbeatPath, deviceId: deviceA.id, credential: issued, body: tampered, requestId: rollbackRequestId })
+      assert.equal(retryAfterRollback.status, 200)
+
+      const rotatedResponse = await issue(deviceA)
+      assert.equal(rotatedResponse.status, 201)
+      const rotated = (await rotatedResponse.json()).data
+      const revoked = await request(`/api/devices/${deviceA.id}/credentials/${issued.credential.id}/revoke`, managerToken, {
+        method: 'POST', body: JSON.stringify({ reason: 'Rotate the device credential during pilot maintenance' })
+      })
+      assert.equal(revoked.status, 200)
+      const unauthorizedRevoke = await request(`/api/devices/${deviceA.id}/credentials/${rotated.credential.id}/revoke`, foreignToken, {
+        method: 'POST', body: JSON.stringify({ reason: 'Unauthorized foreign tenant credential revocation' })
+      })
+      assert.equal(unauthorizedRevoke.status, 404)
+      const deniedRevoked = await signDeviceCall({ path: heartbeatPath, deviceId: deviceA.id, credential: issued, body })
+      assert.equal(deniedRevoked.status, 401)
+      assert.equal((await deniedRevoked.json()).error, unknownBody.error)
+      const acceptedRotated = await signDeviceCall({ path: heartbeatPath, deviceId: deviceA.id, credential: rotated, body })
+      assert.equal(acceptedRotated.status, 200)
+      const revokedAudit = await prisma.auditEvent.findFirst({ where: { action: 'DEVICE_CREDENTIAL_REVOKED', resourceId: issued.credential.id } })
+      assert.ok(revokedAudit)
+      assert.equal(JSON.stringify(revokedAudit).includes(issued.privateKey), false)
+    })
 
     await t.test('tenant route authorization and public registration', async () => {
       const registration = await request('/api/auth/register', null, { method: 'POST', body: JSON.stringify({ name: 'Public Driver', email: `public-${unique}@example.test`, password: 'test-password-123' }) })

@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 
 const baselineSql = readFileSync(new URL('../prisma/migrations/20261015100000_baseline/migration.sql', import.meta.url), 'utf8')
 const additiveSql = readFileSync(new URL('../prisma/migrations/20261015101000_add_tenant_presence_evidence_audit/migration.sql', import.meta.url), 'utf8')
+const deviceSql = readFileSync(new URL('../prisma/migrations/20261016100000_device_credentials_replay_protection/migration.sql', import.meta.url), 'utf8')
 
 test('existing-database baseline has an explicit adopt-only warning', () => {
   assert.match(baselineSql, /Clean database bootstrap only/)
@@ -32,6 +33,20 @@ test('existing-database workflow compares schema before resolving the baseline',
   const workflow = readFileSync(new URL('../../.github/workflows/db-setup.yml', import.meta.url), 'utf8')
   assert.match(workflow, /migrate diff --from-url .*baseline-schema\.prisma --exit-code/)
   assert.ok(workflow.indexOf('Verify existing database exactly matches') < workflow.indexOf('Adopt the reviewed baseline'))
+})
+
+test('device credential migration stores public keys and enforces per-device replay uniqueness', () => {
+  assert.match(deviceSql, /CREATE TABLE "DeviceCredential"/)
+  assert.match(deviceSql, /"publicKey" TEXT NOT NULL/)
+  assert.doesNotMatch(deviceSql, /privateKey|secretHash|DEVICE_API_KEY/i)
+  assert.match(deviceSql, /CREATE UNIQUE INDEX "DeviceRequest_deviceId_requestId_key"/)
+  assert.match(deviceSql, /"ingestionEnabled" BOOLEAN NOT NULL DEFAULT true/)
+})
+
+test('PostgreSQL adoption harness validates the complete current migration chain', () => {
+  const migrationHarness = readFileSync(new URL('../scripts/test-postgres-migrations.js', import.meta.url), 'utf8')
+  assert.match(migrationHarness, /const expectedMigrationChain = migrationDirectories/)
+  assert.match(migrationHarness, /!== expectedMigrationChain/)
 })
 
 test('PostgreSQL harness is restricted to the named loopback test databases', () => {

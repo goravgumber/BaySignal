@@ -1,0 +1,3 @@
+cryptography>=42,<49
+psutil>=5.9,<8
+requests>=2.31,<3
