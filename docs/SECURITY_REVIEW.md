@@ -1,47 +1,140 @@
 # BaySignal Security Review
 
-**Review date:** 2026-10-16
-**Scope:** Static review of the feature branch, Git history, route/socket access paths, PostgreSQL tests, deployment manifest, and npm production dependency audits. No production database, deployment service, or external application endpoint was accessed.
+**Latest Review Date:** 2026-10-17 (Phase 4 Controlled Pilot Preparation)
+**Initial Review Date:** 2026-10-16
+**Scope:** Static review of application source, feature branch history, route/socket authentication paths, PostgreSQL migration and integration tests, deployment manifests, npm production dependency audits, and Python device signing. No production database, hosting environment, or physical hardware was accessed or modified.
 
-## Resolved in the feature branch
+---
 
-- Removed the development JWT fallback and require an explicitly configured signing key of at least 32 characters. Production configuration also requires an HTTPS frontend origin; device ingestion now uses individually issued public-key credentials.
-- Removed the prefilled demo login and fixed seed password. Demo seeding is opt-in, rejects production, and requires a locally supplied password.
-- Added tenant-scoped facility and reservation route integration tests, including inaccessible legacy facilities, foreign tenant data, finance data minimization, and disabled-by-default public booking.
-- Changed server error logging to emit correlation and error-class metadata without serializing the exception object. Unknown-route responses no longer reflect a request URL or query string.
-- Updated React Router to 7.18.4 and constrained the server's transitive `qs` dependency to 6.16.1. Both production dependency trees pass `npm audit --omit=dev`.
+## 1. Resolved in Repository Baseline (Phases 1–3)
 
-## Human action required: historical credentials
+- **Removed insecure defaults:** Eliminated development JWT fallback key and require explicitly configured signing keys of at least 32 characters (`server/src/config.js`). Production configuration requires a valid HTTPS frontend origin.
+- **Removed prefilled demo credentials:** Demo seeding (`server/prisma/seed.js`) is opt-in, explicitly rejects `NODE_ENV=production`, and requires locally supplied credentials.
+- **Tenant boundary enforcement:** Tenant-scoped authorization guards (`server/src/tenantAccess.js`) protect all facility, device, reservation, observation, and Socket.IO room endpoints. Legacy unmapped facilities remain inaccessible by design.
+- **Redacted error handling:** Server errors return correlation request IDs. Exception message strings and stack traces are suppressed in HTTP responses and process-level logs (`server/src/safeLogging.js`).
+- **Cryptographic device authentication:** Replaced shared static API key with per-device Ed25519 signatures. Server stores only public keys (SPKI DER base64url). One-time PKCS#8 DER private keys are exported directly to the authorized caller.
+- **Replay resistance:** Requests require an exact canonical digest binding method, URL path/query, timestamp, request UUID, and raw request body SHA-256. Database-backed `(deviceId, requestId)` uniqueness rejects concurrent and serial replays.
+- **Production dependency hygiene:** `npm audit --omit=dev` reports 0 vulnerabilities for both `client/` and `server/`.
 
-The old default-branch source and commit history contain a fixed demo-account password and a weak development JWT signing fallback. The affected historical source paths are `server/src/routes/auth.js` and `server/src/config.js`; the insecure defaults are absent from the current feature-branch runtime. The values remain recoverable from prior Git commits. The repository is private now; a checked-in discovery document states it was public, but historical visibility could not be independently verified. Treat the demo password as exposed. It is not possible from repository inspection to determine whether those demo accounts were ever created in a live database or whether any environment used the old JWT fallback. This is a committed credential with unknown deployment/use, not a credential confirmed used live.
+---
 
-Before any real pilot, the owner should:
+## 2. Phase 4 Hardening: Diagnostic Safety & Controlled Pilot Foundations
 
-1. Identify whether the demo account addresses exist in any live database. Disable unused demo accounts and reset credentials for any account that remains.
-2. Rotate `JWT_SECRET` in each deployed environment, verify the new value is generated randomly and stored only in the platform secret store, and require users to authenticate again. Rotation invalidates tokens signed with the old value.
-3. Confirm that no active deployment relies on the old source default. `render.yaml` now requests a generated `JWT_SECRET`, but the current dashboard value and deployed commit were not inspected.
-4. Review repository visibility/audit history and any copies or forks. No history rewrite was performed; rotation is the required remediation for retained Git objects.
+- **Diagnostic log redaction:** Added `logDiagnostic` in `server/src/safeLogging.js` with automated regex scrubbing (`/secret|token|password|auth|key|signature|body|rawBody|hash|digest|private/i`). Diagnostic warnings for device rejection, timestamp drift, and replay attempts log correlation IDs while redacting credentials and payloads.
+- **Dedicated observation ingestion endpoint:** Implemented `POST /api/devices/:id/observations` with full Ed25519 signature verification, replay protection, and `DEVICE_REPORT` provenance. Real pilot devices no longer depend on the development `/api/simulation/pi-payload` route.
+- **Device diagnostics endpoint:** Added `GET /api/devices/diagnostics` calculating device reporting freshness (`ONLINE` < 300s, `STALE` 300–900s, `OFFLINE` > 900s) and active/revoked credential counts without exposing private or sensitive metadata.
+- **Readiness check:** Added `GET /health/ready` verifying database connectivity via `SELECT 1` without revealing database credentials or connection parameters upon failure.
+- **Graceful shutdown:** Implemented `SIGTERM` and `SIGINT` signal handlers in `server/src/index.js` to stop accepting requests, drain sockets, and disconnect Prisma cleanly before process termination.
+- **Safe onboarding dry-run:** Added `server/scripts/onboarding-dry-run.js` allowing platform operators to simulate tenant and facility mappings and detect tenant crossovers without executing database writes.
+- **Secure Raspberry Pi key loading:** Updated `raspberry_pi/smartpark_agent.py` to support `BAYSIGNAL_DEVICE_PRIVATE_KEY_PATH` with POSIX file permission checks (`chmod 600`), preventing key exposure in process environment listings.
 
-The JWT secret is not set to a fallback in development either: provide a locally generated value in an ignored `.env` file. The checked-in example contains placeholders only. Test-only passwords and keys exist in test fixtures and the isolated CI workflow; they are not production credentials. No production secret or live account was inspected.
+---
 
-No password, signing key, token, or production environment was accessed or rotated during this review.
+## 3. Owner-Only Credential Remediation
 
-## Release blockers and limitations
+The old default-branch source and commit history historically contained a fixed demo-account password and a weak development JWT signing fallback. The affected historical paths are `server/src/routes/auth.js` and `server/src/config.js`.
 
-- **Device credential transition:** New device heartbeat and Raspberry Pi ingestion use per-device Ed25519 signatures. Authorized `FACILITY_MANAGER` and `DEVICE_TECHNICIAN` users can issue and revoke a device credential; issuance/revocation are audited. The private key is returned once and only its public key is stored. Requests are bound to method, exact URL path/query, timestamp, request ID, and the SHA-256 digest of the exact raw JSON bytes. Timestamps may differ from server time by at most 300 seconds. A unique `(deviceId, requestId)` database key prevents concurrent replay; request IDs expire after 600 seconds, and expired rows are removed on a later request from that device. Replay row creation and ingestion writes share a transaction.
-- **Legacy device compatibility:** The old global key is not used unless `ALLOW_LEGACY_DEVICE_API_KEY=true` and a separate `LEGACY_DEVICE_API_KEY` plus explicit `LEGACY_DEVICE_API_KEY_EXPIRES_AT` are configured. Legacy requests do not have timestamp/signature/replay protection and retain the historical cross-device blast radius. Production validation rejects a missing/expired cutoff or a cutoff over 30 days away. Keep this disabled by default; enable only for an inventoried migration, then disable it once all clients have moved to signed requests. There is no built-in legacy-client usage metric, so confirm cutover from device/operator inventory before enabling and verify externally before disabling.
-- **Device key rotation:** Issue a replacement credential, securely install its one-time private key on that device, verify a signed heartbeat, then revoke the previous credential. Revocation is per credential and does not invalidate other devices. Lost private keys cannot be recovered from the server; issue a replacement and revoke the lost credential.
-- **Historical exposure status:** present-day repository privacy is verified, but past public visibility and actual use of the old seed/fallback cannot be established from the checked-out repository. Complete the rotation review above before pilot access.
-- **Rate-limit topology:** Express's rate limiter is in-memory and disabled outside production. It is suitable only for a single instance; multi-instance deployment needs a shared store and an explicit proxy/IP policy.
-- **PostgreSQL validation:** the PostgreSQL 16 GitHub Actions run passed. Local PostgreSQL 18 was not used because credentials and the contents of the harness's fixed destructive target names are unknown.
-- **Unpatched development dependencies:** full audits report a high-severity `braces` advisory through `nodemon` on the server and Tailwind's development tree on the client, plus moderate development-tool advisories involving esbuild/Vite and PostCSS selector parsing. The current production-only audits are clean. These packages are build/watch tooling, not shipped runtime dependencies; the `braces` advisory has no patched release. Keep development servers off untrusted networks and reassess the toolchain when compatible fixed releases are available.
-- **Platform protections:** GitHub reports that branch-protection settings require a higher plan for this private repository (HTTP 403). The repository's current settings expose no required-review or required-status-check configuration through the available plan. Do not treat CI passing as a substitute for human review.
+> [!IMPORTANT]
+> No production database, hosting environment, secret store, or live account was accessed. Whether demo accounts or the weak JWT fallback were ever used in a live environment cannot be determined from repository inspection alone. Remediation cannot be marked complete until the repository owner verifies the live environment.
 
-## Reviewed controls
+### Remediation Checklist & Status Template for Repository Owner
 
-- HTTP routes use JWT authentication and facility/organization access checks; tenant route tests cover foreign facilities, visits, reservations, public booking, and finance-field exclusion.
-- Socket connections require JWTs and facility-room joins check current database access. The PostgreSQL 16 integration suite now tests invalid-token rejection, an authorized manager joining a facility room, and a foreign-tenant manager being denied.
-- Device signatures use Node's Ed25519 verification; authentication failures return one generic response and do not log request headers, signatures, or body contents. The database stores only public key material. Device maintenance/disabled state is rejected at authentication time.
-- Express JSON request bodies are capped at 50 KB. Reservation pagination is capped at 100 rows; operations lists are capped at 100.
-- CORS uses the configured frontend origin; production configuration requires a valid HTTPS origin. The Socket.IO wildcard fallback is reachable only if frontend configuration is empty, which production validation rejects.
-- Audit rows have database triggers against ordinary update/delete operations. Database owners can still alter the schema or remove triggers; this is not cryptographic immutability.
+| Remediation Item | Target Environment | Owner Verification Step | Current Status |
+|---|---|---|---|
+| **R-1: Live Demo Account Audit** | Staging & Production DB | Inspect `User` table for `admin@smartpark.ai`, `driver@smartpark.ai`, `owner@smartpark.ai`. Establish if rows ever existed. | `pending owner verification` |
+| **R-2: Demo Account Deactivation** | Live DB | Disable or delete unneeded demo accounts. For any retained account, generate a cryptographically strong random password. | `pending owner action` |
+| **R-3: Historical JWT Fallback Audit** | Hosting dashboard | Inspect environment variable configurations on Render / hosting provider for active or historical `JWT_SECRET`. | `pending owner verification` |
+| **R-4: JWT Secret Rotation** | Live Hosting Secret Store | Generate a cryptographically random secret (32+ chars: `openssl rand -base64 32`) and inject into hosting environment. | `pending owner action` |
+| **R-5: Orderly Session Invalidation** | Client & API | Deploy rotated `JWT_SECRET`. Verify all existing user JWTs return 401 and require fresh authentication. | `pending owner action` |
+| **R-6: Repository History Remediation** | GitHub Repository | Decide whether repository history rewrite (`git filter-repo`) is required or if secret rotation satisfies threat model. | `pending owner policy decision` |
+| **R-7: Hosting Dashboard Branch Audit** | Render Dashboard | Check deployed branch and commit in Render. Ensure auto-deploy is disabled or pinned to approved release tags. | `pending owner verification` |
+
+### Step-by-Step JWT Rotation & Session Invalidation Runbook
+
+1. **Schedule Maintenance Window:** Notify pilot facility operators of a brief 5-minute authentication reset window.
+2. **Generate New Secret:** Run locally:
+   ```bash
+   openssl rand -base64 36
+   ```
+3. **Inject Secret:** In the hosting provider dashboard (e.g., Render Environment Settings), update `JWT_SECRET` with the generated value. Never commit this value to Git.
+4. **Trigger Rolling Restart:** Restart the web service process. Startup validation will confirm `JWT_SECRET` length >= 32 characters.
+5. **Verify Invalidation:** Attempt an API request with an old JWT token; confirm it returns HTTP 401 `{"success": false, "error": "Invalid or expired token.", "code": 401}`.
+6. **Re-authenticate:** Have authorized operators log in via `/api/auth/login` to obtain newly signed JWT tokens.
+
+---
+
+## 4. Device Authentication: Physical Installation & Rollout Architecture
+
+### Provisioning Sequence for One Pilot Device
+
+```text
+[Operator Dashboard / CLI]
+       │
+       │ 1. POST /api/devices (Register deviceCode under Facility ID)
+       ▼
+[PostgreSQL Database] ─── Creates Device (status: ONLINE, ingestionEnabled: true)
+       │
+       │ 2. POST /api/devices/:id/credentials (Issue Ed25519 Keypair)
+       ▼
+[Server Engine] ─── Stores SPKI Public Key in DB; exports PKCS#8 Private Key once
+       │
+       │ 3. Secure Out-of-Band Transfer (SSH / SCP over local network)
+       ▼
+[Raspberry Pi Hardware] ─── Stored at /etc/baysignal/device_key.der (chmod 600)
+       │
+       │ 4. Signed Heartbeat: PUT /api/devices/:id/heartbeat
+       ▼
+[Server Verifier] ─── Validates Ed25519 signature, timestamp window, & replay ID
+```
+
+### Key Storage and File Permissions on Raspberry Pi
+
+1. **Storage Location:** Private key is written to `/etc/baysignal/device_key.der` (or an operator-specified secure path).
+2. **Permission Hardening:**
+   ```bash
+   sudo mkdir -p /etc/baysignal
+   sudo chown -R baysignal:baysignal /etc/baysignal
+   sudo chmod 700 /etc/baysignal
+   sudo chmod 600 /etc/baysignal/device_key.der
+   ```
+3. **Enforcement in Agent:** `raspberry_pi/smartpark_agent.py` checks file mode on POSIX systems: if group/other read permissions exist (`st_mode & 0o077 != 0`), a security warning is logged recommending `chmod 600`.
+4. **Environment Isolation:** The key is read from file into memory only for signing; it is never logged, printed, or exported.
+
+### Credential Revocation & Key Rotation Runbook
+
+1. **Issue Replacement Key:** While the device is running, an authorized facility manager issues a new credential via `POST /api/devices/:id/credentials`.
+2. **Deploy New Key:** Install the replacement private key file onto the Raspberry Pi and update `BAYSIGNAL_DEVICE_CREDENTIAL_ID`.
+3. **Verify Reporting:** Confirm that the device's signed heartbeat or observation succeeds with the new credential ID.
+4. **Revoke Old Key:** Revoke the old credential via `POST /api/devices/:id/credentials/:oldCredentialId/revoke` with a mandatory reason (minimum 10 characters).
+5. **Confirm Revocation:** Ensure subsequent requests using the old key receive HTTP 401. Revocation is recorded in `AuditEvent`.
+6. **Compromise Response:** If a device key is compromised, immediately call revoke on that credential or set `ingestionEnabled: false` on the device.
+
+---
+
+## 5. Legacy Device Authentication Sunset Policy
+
+The legacy shared API key path (`x-device-key`) represents a single-point-of-failure cross-device blast radius.
+
+### Sunset Plan:
+1. **Default Off:** `ALLOW_LEGACY_DEVICE_API_KEY` is `false` by default in all environments.
+2. **Strict Expiration Guard:** If enabled, `LEGACY_DEVICE_API_KEY_EXPIRES_AT` must be set to a valid ISO date within 30 days. Startup validation fails closed if the expiration is missing or exceeded.
+3. **Zero Legacy Production Pilot:** The Phase 4 pilot environment strictly prohibits legacy authentication. All pilot devices must use signed Ed25519 requests.
+4. **Complete Cutoff:** Once legacy hardware is inventoried and updated, the compatibility middleware will be deprecated and removed from the codebase.
+
+---
+
+## 6. Diagnostic Logging & Privacy Controls
+
+- **Redaction by Design:** Express error handlers and `logDiagnostic` strip raw bodies, authorization headers, signature strings, and credentials.
+- **Safe Authentication Rejections:** Failed device signature checks return generic 401 errors to the client while emitting structured diagnostic logs to stdout with correlation reasons (`invalid_signature`, `timestamp_out_of_window`, `credential_not_found_or_revoked`) without leaking cryptographic material.
+- **Vehicle Data Privacy:** Vehicle entries in `FacilityVisit` accept only 64-character pseudonymous digests (`/^[a-f0-9]{64}$/i`). Raw plate numbers and camera frame captures are prohibited from the evidence ledger.
+- **Append-Only Auditing:** Database triggers prevent `UPDATE` or `DELETE` on `AuditEvent` rows, preserving non-repudiable audit trails of all administrative actions.
+
+---
+
+## 7. Security Limitations & Production Blockers
+
+1. **Database Tier:** Render free PostgreSQL has a 30-day lifespan and lacks point-in-time recovery and managed backups. A funded PostgreSQL plan is required before a pilot.
+2. **Branch Protection:** Private GitHub repository plan returns 403 on branch protection API. Manual review discipline must prevent direct commits to `main`.
+3. **In-Memory Rate Limiting:** Single-node rate limiting is memory-bound; multi-instance deployment requires Redis or an equivalent shared cache.
+4. **Physical Bench Testing:** Physical hardware testing has not been performed; testing is verified through automated CI suites.

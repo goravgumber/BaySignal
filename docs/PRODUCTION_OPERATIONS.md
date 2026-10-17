@@ -1,65 +1,236 @@
 # BaySignal Deployment and Operations Readiness
 
-BaySignal is a prototype with tenant-scoped APIs and PostgreSQL migrations. This document describes the guarded path and current limits; it does not authorize a deployment or database change.
+BaySignal is a multi-tenant parking operations and auditable evidence platform. This document defines the operational procedures, evidence workflows, tenant onboarding, monitoring diagnostics, backup/recovery, and privacy inventory required to operate a controlled pilot with one real device at one pilot facility.
 
-## Current operating model
+> [!WARNING]
+> This runbook does NOT authorize a production deployment or live schema migration without explicit repository owner approval and environment verification.
 
-- Supported integration target: PostgreSQL 16. The GitHub Actions tests use an ephemeral PostgreSQL 16 service with test-only credentials.
-- Runtime settings are supplied through environment/secret stores: `DATABASE_URL`, `JWT_SECRET` (32+ characters, randomly generated), `FRONTEND_URL` (HTTPS origin), `NODE_ENV=production`, and `TRUST_PROXY=true` only behind the known one-hop trusted proxy. Per-device public keys and replay IDs are stored in PostgreSQL. The legacy global device key is disabled by default. Client settings are `VITE_API_URL` and `VITE_WS_URL`.
-- Do not put secrets in `.env.example`, Git, workflow YAML, shell history, or build output. The checked-in Render blueprint requests a generated JWT key; device credentials are issued per device. Verify deployed secret settings through the provider's secret UI without printing values.
-- `GET /health` is a liveness response only; it does not check PostgreSQL readiness. The process connects to PostgreSQL at startup and exits if that connection fails. A separate authenticated/low-information readiness check is still needed before production use.
-- JWT and database configuration are validated during startup; a missing JWT secret fails closed. Do not treat `.env.example` placeholders as deployable secrets. Device credentials are issued through an authenticated API and are not environment-wide secrets.
-- Render's checked-in blueprint sets `autoDeploy: true`. The service's configured deployment branch and current live commit were not inspected. Verify those settings before publishing further changes; do not merge or deploy this feature branch automatically.
+---
 
-## Database provisioning and migration gate
+## 1. Operating Model & Runtime Architecture
 
-1. Provision a PostgreSQL database with TLS/network restrictions, an application role with only required schema privileges, and a separate backup/restore role. Keep administrative credentials outside the app runtime.
-2. Create a restorable backup and verify a restore into an isolated database before a production schema change.
-3. For an existing database, obtain a schema-only comparison against `server/prisma/baseline-schema.prisma` and the old checked-in schema. Do not infer compatibility from app version or table names. Stop on any difference.
-4. For an empty database, verify it is genuinely empty. Use the manual migration workflow's `fresh-empty-database` path only after owner review. For an exact old-schema match, use `existing-schema-compared` only after the comparison and backup are reviewed.
-5. The manual workflow requires explicit confirmation and either applies the baseline to an empty database or records the already-existing baseline before applying the additive migration. It does not seed data or bootstrap a platform administrator.
-6. Inspect migration history and application health after the change. If a migration fails, stop writes as appropriate, preserve safe logs, and have the database owner direct recovery. The repository has no down-migration workflow; assume migrations are forward-only. Restore a verified backup or apply a reviewed forward repair under the recovery plan. Do not roll back application code against an incompatible schema or rerun blindly.
+- **Database Engine:** PostgreSQL 16 is the verified automated integration target.
+- **Runtime Configuration:**
+  - `DATABASE_URL`: Connection string with TLS (`sslmode=require` in production). Must use a restricted application user role (no schema-dropping or superuser privileges).
+  - `JWT_SECRET`: Random string of 32+ characters, stored strictly in provider secret manager.
+  - `FRONTEND_URL`: Fully qualified HTTPS origin of the frontend web application.
+  - `NODE_ENV`: `production` for deployed instances; enforces HTTPS, rate limiting, and disables simulation shortcuts.
+  - `TRUST_PROXY`: `true` only when running behind a single-hop trusted reverse proxy (e.g., Render, Nginx, Cloudflare).
+  - `PORT`: Server listening port (default: 4000).
+  - `ALLOW_LEGACY_DEVICE_API_KEY`: `false` by default. If enabled for migration, requires `LEGACY_DEVICE_API_KEY` and `LEGACY_DEVICE_API_KEY_EXPIRES_AT` (< 30 days away).
+- **Client Configuration:** `VITE_API_URL` (HTTPS) and `VITE_WS_URL` (WSS).
+- **Secret Hygiene:** Never commit secrets to `.env.example`, Git history, Dockerfiles, or log sinks.
 
-Assign named people before any production change: the service owner approves the window and customer communication; the database owner approves schema/migration mode and recovery; the backup operator verifies and restores the isolated backup; the application operator monitors rollout and health. Record the actual names and escalation route in the deployment runbook before a pilot.
+---
 
-Never use `prisma db push`, the seed command, the platform-admin bootstrap, or the PostgreSQL test harness against a production or unidentified database. The test harness drops and recreates four fixed `baysignal_test_*` names; use only its ephemeral CI service or independently confirmed disposable databases.
+## 2. Tenant and Facility Administrative Onboarding Plan
 
-## Backups and restore
+Legacy facilities in BaySignal intentionally have `organizationId = NULL` upon migration adoption and remain inaccessible to ordinary tenant users until a platform administrator explicitly maps them.
 
-Backups must be encrypted, access-controlled, retained outside the database host, and periodically restored into an isolated environment. Record backup time, schema/migration version, retention, restore owner, and measured recovery time. Do not treat a successful `pg_dump` exit as restore verification.
+### Administrative Onboarding Procedure:
+1. **Bootstrap Platform Administrator (One-Time Only):**
+   - The repository owner selects an existing user account.
+   - Runs `npm run admin:bootstrap-platform` with explicit confirmations:
+     ```bash
+     PLATFORM_ADMIN_EMAIL="owner@example.com" \
+     PLATFORM_ADMIN_BOOTSTRAP_REASON="Authorized platform bootstrap for pilot rollout" \
+     PLATFORM_ADMIN_BOOTSTRAP_CONFIRM="GRANT-PLATFORM-ADMIN" \
+     npm run admin:bootstrap-platform
+     ```
+   - Transaction promotes the account and creates an append-only `AuditEvent`.
+2. **Create Organization:**
+   - Platform admin calls `POST /api/tenants/organizations` with `{ "name": "Pilot Parking Operator", "slug": "pilot-operator" }`.
+   - Creates `Organization` and logs `ORGANIZATION_CREATED` audit event.
+3. **Map Existing Facility to Organization:**
+   - Platform admin calls `POST /api/tenants/facilities/:facilityId/organization` with:
+     ```json
+     {
+       "organizationId": "<org-uuid>",
+       "reason": "Assigning Downtown Lot 1 to Pilot Parking Operator for Phase 4 pilot"
+     }
+     ```
+   - Validates facility is currently unassigned; prevents accidental transfers; logs `FACILITY_ASSIGNED_TO_ORGANIZATION`.
+4. **Appoint Organization & Facility Members:**
+   - Platform admin creates Organization Admin: `POST /api/tenants/organizations/:id/memberships` with role `ORG_ADMIN`.
+   - Org Admin or Platform Admin grants Facility Manager or Attendant role:
+     ```json
+     {
+       "userId": "<user-uuid>",
+       "role": "FACILITY_MANAGER",
+       "facilityId": "<facility-uuid>",
+       "reason": "Assigning facility manager for pilot facility operations"
+     }
+     ```
+   - Records `MEMBERSHIP_CREATED` and `FACILITY_ACCESS_GRANTED` audit events.
 
-No application-level retention or deletion schedule is implemented for reservations, device observations, replay records, or audit events. Replay entries expire after 600 seconds and are physically removed on that device's next accepted signed request; this is not a general data-retention job. Before a pilot, the service owner and privacy/data owner must define purposes, retention periods, deletion/subject-request handling, and the treatment of reservation PII, device IP addresses, and audit history. Audit history is append-only through ordinary application SQL, so deletion exceptions need a reviewed database-owner procedure.
+### Dry-Run Verification Tool (`onboarding-dry-run.js`)
+Operators can simulate an onboarding plan before executing privileged writes:
+```bash
+# 1. Inspect unassigned facilities and unmapped users:
+npm run tenant:dry-run
 
-The Render blueprint currently declares a free PostgreSQL database. Render documents that free Postgres databases expire after 30 days and do not include managed backups; free web services can spin down when idle. Render explicitly says free instances are not for production. Therefore the current `$0` configuration is suitable only for disposable demos/tests, not for a production pilot with data durability or recovery expectations. A pilot needs a funded database/backup plan or an independently operated and verified backup design. See [Render free instance limitations](https://render.com/docs/free) and [Render Postgres backups](https://render.com/docs/postgresql-backups).
+# 2. Dry-run a proposed onboarding mapping file:
+ONBOARDING_PLAN_FILE=./onboarding-plan.json npm run tenant:dry-run
+```
+The dry-run script verifies that facilities exist and are unassigned, organizations and users exist, grants are valid, and no tenant cross-contamination occurs. No database writes are executed.
 
-## TLS, keys, access, and incidents
+---
 
-- Terminate HTTPS at the hosting provider, require TLS for database connections, restrict database ingress to the app/administrator paths, and avoid public database endpoints where private networking is available.
-- Rotate JWT signing keys through the secret manager. Rotation of `JWT_SECRET` invalidates existing signed sessions. Revoke account memberships for access removal; confirm revocation on API and socket paths.
-- Device authentication uses Ed25519. The credential issuance endpoint returns a PKCS#8 DER private key as base64url exactly once; the server stores the corresponding SPKI DER public key. The device must keep its private key in protected storage and use HTTPS. No database backup or API response should be treated as a private-key recovery mechanism.
-- Canonical signing bytes are UTF-8 for `METHOD\nPATH_AND_QUERY\nUNIX_TIMESTAMP_SECONDS\nREQUEST_UUID\nLOWERCASE_HEX_SHA256_OF_RAW_BODY`. `METHOD` is uppercase; `PATH_AND_QUERY` is the exact request URL path/query received by Express; the digest is over exact HTTP JSON body bytes before parsing. The signature is Ed25519 and is sent as unpadded base64url. Headers carry the credential ID, device ID, timestamp, request UUID, and signature. Requests outside ±300 seconds are rejected. A unique device/request UUID row makes concurrent replays fail; rows expire after 600 seconds and cleanup occurs on that device's later accepted request.
-- Credential issuance and revocation require facility-scoped `FACILITY_MANAGER` or `DEVICE_TECHNICIAN` access and create audit events. For rotation, issue a replacement, install it on the device, verify a signed request, then revoke the old credential. Lost private keys must be replaced and revoked, not recovered.
-- Legacy global-key compatibility is disabled by default. Its explicit flag requires a strong legacy key and a cutoff no more than 30 days away. Legacy requests have no timestamp/signature/replay protection and the key spans devices. Use only for an inventoried client transition; confirm all devices have moved to signed requests and turn the compatibility flag off. The application does not provide a legacy-usage dashboard, so use hardware inventory/operator confirmation as cutoff evidence.
-- On suspected credential exposure, restrict affected access, rotate the relevant key, invalidate sessions, preserve audit/provider logs, identify affected accounts and devices, and review database access. Do not post tokens, plates, or raw credentials in issue reports.
-- Application errors are returned with a request ID; logs emit safe metadata only. A managed structured-log sink, retention policy, alerting, and incident owner are not configured in this repository.
+## 3. One-Device, One-Facility Evidence Workflow
 
-## Runtime, health, and capacity
+The application explicitly distinguishes raw device telemetry from verified physical occupancy truth. Gate/ANPR and camera integrations are not live and must not be simulated as verified hardware.
 
-- Graceful shutdown and readiness checks are not implemented. Add signal handling to stop accepting requests, drain sockets, and close Prisma cleanly before multi-instance production use.
-- Rate limits use per-process memory and are disabled outside production. Use a shared store for multiple instances and confirm client IP derivation behind the actual proxy.
-- Database connection limits, pool sizing, statement timeouts, alert thresholds, and capacity targets have not been validated for a production workload.
-- The server uses Prisma's configured PostgreSQL connection pool; there is no separate pool-management worker or graceful shutdown handler. Measure connection use under the intended instance count and set provider/database limits before scaling.
-- Analytics, revenue, environmental reports, trusted gate/ANPR processing, and real bay-sensor integrations remain unavailable or unimplemented. Do not present simulator output as production evidence.
+### Event Path: One Sensor/Device to Physical Occupancy
+```text
+[ Physical Sensor / Raspberry Pi ]
+               │
+               │ 1. Signs payload with local Ed25519 private key (chmod 600)
+               ▼
+[ Authenticated Ingestion: POST /api/devices/:id/observations ]
+               │
+               │ 2. Verifies signature, timestamp (±300s), deviceId, and UUID replay guard
+               ▼
+[ Validated BayObservation Record ]
+               │
+               │ 3. Stored with source: 'DEVICE_REPORT', confidence, and deduplicationKey
+               │    (NOTE: DEVICE_REPORT alone is NOT trusted physical evidence!)
+               ▼
+[ Evidence Reconciler: POST /api/operations/slots/:id/reconcile ]
+               │
+               │ 4. Evaluates usable evidence from trusted sources:
+               │    ['BAY_SENSOR', 'OVERHEAD_CAMERA', 'ATTENDANT']
+               │    (DEVICE_REPORT is contextual telemetry; stays excluded unless policy elevates)
+               ▼
+  ┌────────────────────────────┬────────────────────────────┐
+  ▼                            ▼                            ▼
+[ Consistent Truth ]   [ Stale / No Data ]       [ Contradictory Evidence ]
+Updates ParkingSlot    Preserves 'UNKNOWN'       Creates Discrepancy:
+status: AVAILABLE/     status; flags for         BAY_EVIDENCE_CONFLICT
+OCCUPIED + AuditEvent  attendant check           with linked observations
+                                                            │
+                                                            │ 5. Attendant Review
+                                                            ▼
+                                                 [ POST /api/operations/discrepancies/:id/resolve ]
+                                                 Attendant submits reasoned correction + AuditEvent
+```
 
-## Release checklist
+### Distinct Gate Entry/Exit Workflow (Future Trusted Adapter)
+Gate events follow a strictly isolated lifecycle through internal service `processVerifiedGateEvent`:
+- Entry: `GateEvent` (INBOUND, VERIFIED) opens a `FacilityVisit`. It records vehicle presence at the facility.
+- **Rule:** A gate entry event **never** establishes an individual bay's occupancy.
+- Exit: Matching `GateEvent` (OUTBOUND, VERIFIED) closes the `FacilityVisit`.
+- **Rule:** Bay vacancy **never** closes a facility visit.
+- Duplicate gate events with the same `deduplicationKey` are idempotent and do not create duplicate visits.
 
-- [ ] Owner completed the historical demo-credential/JWT rotation review in `SECURITY_REVIEW.md`.
-- [ ] A production-capable PostgreSQL and verified backup/restore arrangement is funded and tested.
-- [ ] Existing schema is reviewed against the baseline; migration mode is approved by the database owner.
-- [ ] Deployment branch, auto-deploy settings, secret injection, TLS, and network boundaries are verified in the hosting dashboard.
-- [ ] PostgreSQL migration and integration CI passes on PostgreSQL 16; tenant/socket authorization and rollback coverage is complete.
-- [ ] Per-device private keys are securely installed, tested and individually revocable; legacy compatibility is disabled after the documented device inventory confirms cutover.
-- [ ] Readiness, graceful shutdown, shared rate limiting (if scaling), managed logging/alerts, and incident ownership are ready.
-- [ ] Human review approves the PR. No automatic merge or deployment is part of this workflow.
-- [ ] Named service, database, backup/restore, privacy, and application operators and their escalation path are recorded; retention and deletion rules are approved.
-- [ ] The approved deployment commit/branch is confirmed in the hosting dashboard; build/start, health observation, migration gate, rollback/recovery decision, and post-deploy checks are scheduled and assigned.
+---
+
+## 4. Monitoring, Diagnostics, and Incident Response
+
+### Health & Diagnostic Endpoints
+
+| Endpoint | Access | Purpose |
+|---|---|---|
+| `GET /health` | Public | **Liveness:** Process uptime, current server timestamp, status. |
+| `GET /health/ready` | Public / Monitoring | **Readiness:** Verifies database connectivity (`SELECT 1`). Returns 200 `{ status: 'ready' }` or 503 `{ status: 'not_ready' }`. |
+| `GET /api/devices/diagnostics` | `FACILITY_MANAGER`, `DEVICE_TECHNICIAN` | **Device Telemetry:** Ping age (s), reporting status (`ONLINE` < 300s, `STALE` 300–900s, `OFFLINE` > 900s), active/revoked key count. |
+| `GET /api/operations/audit` | `PLATFORM_ADMIN`, `ORG_ADMIN`, `FACILITY_MANAGER` | **Audit Trail:** Append-only ledger of all privileged changes, device registrations, corrections, and alerts. |
+
+### Operator Diagnostic Matrix
+
+| Failure Symptom | Diagnostic Tool / Log Event | Root Cause & Resolution |
+|---|---|---|
+| **Device stopped reporting** | `GET /api/devices/diagnostics` reports `STALE` or `OFFLINE` | Check device network, power, local logs at `/var/log/baysignal.log`. Verify device process is running. |
+| **Signature rejected / 401** | `logDiagnostic('device_auth_rejected', { reason: 'invalid_signature' })` | Key mismatch or tampering. Verify public key in database matches private key on Pi. Re-issue credential if necessary. |
+| **Timestamp out of window** | `logDiagnostic('device_auth_rejected', { reason: 'timestamp_out_of_window', deltaSeconds })` | Raspberry Pi system clock drift. Ensure NTP/systemd-timesyncd is synchronized on device (`timedatectl`). |
+| **Replayed request / 409** | `logDiagnostic('device_request_replay_rejected', { deviceId })` | Network retry or duplicate UUID. Ensure agent generates unique UUID per transmission attempt. |
+| **Credential revoked** | `logDiagnostic('device_auth_rejected', { reason: 'credential_not_found_or_revoked' })` | Credential was revoked via API. Follow key rotation runbook to re-enroll device with a new keypair. |
+| **Database connectivity failure** | `GET /health/ready` returns 503; `logDiagnostic('readiness_check_failed')` | PostgreSQL unreachable. Check hosting database status, connection limits, and network ingress. |
+| **Cross-tenant access denial** | Express 403 response; `logDiagnostic('tenant_access_denied')` | User lacks active membership or facility grant. Operator must review tenant access assignments. |
+
+### Redacted Diagnostic Logging
+Server logs use structured JSON formatting via `logDiagnostic` (`server/src/safeLogging.js`). All keys matching `/secret|token|password|auth|key|signature|body|rawBody|hash|digest|private/i` are automatically masked with `[REDACTED]`. Never attach raw payloads or tokens to diagnostic tickets.
+
+### Graceful Shutdown
+Upon receiving `SIGTERM` or `SIGINT`, the server:
+1. Stops accepting new HTTP connections (`httpServer.close()`).
+2. Drains active Socket.IO connections.
+3. Disconnects Prisma database pool (`prisma.$disconnect()`).
+4. Exits with status code 0.
+
+---
+
+## 5. Backup, Integrity, and Recovery Runbook
+
+> [!CAUTION]
+> Render's free PostgreSQL tier does not support automated backups or point-in-time recovery and expires after 30 days. A funded database plan is mandatory for pilot data retention.
+
+### Database Backup Procedure
+Logical backup using native PostgreSQL tools:
+```bash
+# 1. Execute custom-format compressed backup:
+pg_dump -h <HOST> -p 5432 -U <BACKUP_USER> -d <DB_NAME> -F c -b -v -f baysignal_backup_$(date +%Y%m%d_%H%M%S).dump
+
+# 2. Generate SHA-256 integrity checksum:
+sha256sum baysignal_backup_*.dump > baysignal_backup_$(date +%Y%m%d_%H%M%S).sha256
+
+# 3. Store in access-controlled, encrypted offsite object storage.
+```
+
+### Isolated Restore Verification Procedure (Disposable Target Only)
+```bash
+# 1. Verify file checksum:
+sha256sum -c baysignal_backup_*.sha256
+
+# 2. Restore into a disposable, isolated test database (NEVER into live DB):
+createdb -h localhost -p 5432 -U postgres baysignal_restore_test
+pg_restore -h localhost -p 5432 -U postgres -d baysignal_restore_test -v baysignal_backup_*.dump
+
+# 3. Verify schema compatibility against checked-in baseline:
+npx prisma migrate diff \
+  --from-url postgresql://postgres:password@localhost:5432/baysignal_restore_test \
+  --to-schema-datamodel server/prisma/schema.prisma \
+  --exit-code
+```
+*(Status note: Restore testing in live hosting environment remains unverified pending funded database provisioning).*
+
+### Migration Preflight and Recovery Steps
+1. Before running migrations, perform schema comparison against `server/prisma/baseline-schema.prisma`.
+2. Deploy additive migration: `npx prisma migrate deploy`.
+3. If migration fails:
+   - Do **NOT** run blind down-migrations or raw SQL deletions.
+   - Halt application traffic.
+   - Database owner reviews migration log and executes forward repair migration or restores the verified pre-migration backup.
+
+---
+
+## 6. Pilot Data Inventory & Retention Policy
+
+| Data Class | Purpose | Access Scope | Retention Owner | Deletion / Retention Rules | Backup Handling |
+|---|---|---|---|---|---|
+| **1. Account & Membership** | Authentication & RBAC | `PLATFORM_ADMIN`, User (self) | Service Owner | Retained for account lifetime. Deletion upon user request via reviewed admin flow. | Included in logical backups. Passwords hashed with bcrypt. |
+| **2. Reservations & Legacy Vehicle No.** | Parking booking | `FACILITY_MANAGER`, Driver (self) | Operations Owner | Retained for 90 days post-completion; subject to owner retention policy decision. | Included in logical backups. Excluded from operations views for non-privileged roles. |
+| **3. Device Identities & Public Keys** | Ed25519 authentication | `FACILITY_MANAGER`, `DEVICE_TECHNICIAN` | Hardware Tech Lead | Retained until device decommissioning. Private keys never stored. | Public keys backed up in PostgreSQL. Revoked keys kept for audit trail. |
+| **4. Signed Request IDs / Nonces** | Replay attack prevention | System internal (`DeviceRequest`) | Security Lead | Auto-expires after 600 seconds; purged during subsequent accepted device requests. | Excluded from long-term archival. |
+| **5. Facility Visits & Vehicle References** | Entry/exit presence ledger | `FACILITY_MANAGER`, Platform Admin | Compliance / Privacy Owner | 64-char pseudonymous hashes only. Raw plates prohibited. Default retention: 30 days (pending owner policy). | Included in encrypted database backups. |
+| **6. Bay Observations & Discrepancies** | Occupancy evidence & reconciliation | `FACILITY_MANAGER`, Attendant | Operations Owner | Observations retained for 30 days. Discrepancies and resolution notes retained for 1 year. | Included in database backups. Excluded from raw telemetry dumps. |
+| **7. Audit Records & Diagnostic Logs** | Non-repudiation & forensic review | `PLATFORM_ADMIN`, `ORG_ADMIN`, `FACILITY_MANAGER` | Security & Compliance Owner | Append-only via DB triggers. Retained for 365 days. Never deleted through application API. | Included in encrypted backups. Diagnostic logs to stdout stripped of secrets. |
+
+> [!NOTE]
+> Retention periods marked above represent recommended pilot defaults. Final operational retention periods must be formally approved by the repository owner before commencing pilot operations.
+
+---
+
+## 7. Pilot Rollback and Emergency Stop Criteria
+
+### Immediate Pilot Abort Triggers:
+1. **Cryptographic Key Compromise:** Any evidence that a device private key was exposed or logged.
+2. **Data Corruption Storm:** Automated observation ingestion creates conflicting discrepancy loops on > 20% of bays.
+3. **Database Unavailability:** Database connection failures or transaction timeouts exceeding 5 minutes.
+4. **Tenant Isolation Breach:** Any authorization failure that leaks resources across tenant boundaries.
+
+### Emergency Device Isolation Procedure:
+If a device misbehaves or reports corrupted data:
+1. Revoke active credential immediately: `POST /api/devices/:id/credentials/:credentialId/revoke`.
+2. Disable device ingestion: update `Device` setting `ingestionEnabled = false`.
+3. Set device status: `status = 'MAINTENANCE'`.
+4. Power off physical Raspberry Pi hardware.

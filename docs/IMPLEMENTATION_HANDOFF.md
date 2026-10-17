@@ -184,3 +184,36 @@ No local/production database connection, production migration, seed, administrat
 - Historical demo-password and weak JWT fallback material remains in Git history and on the unmerged base. The demo password is treated as exposed; whether either credential was used in production remains unknown. No credential was read, reset, rotated or invalidated; the owner must complete the documented account and JWT-key review/rotation before a pilot. No production database/service was accessed, and no production migration, seed, admin bootstrap, deployment, merge, or `main`/`develop` push occurred.
 - PostgreSQL 16 CI is verified; local PostgreSQL 18 was not used because the fixed-name destructive test databases and credentials are not verified disposable. Python signing tests were CI-tested; the local Python runtime was unavailable. Existing production schema and facility/organization mapping, backup restore, deployed branch/configuration, key installation on actual devices, legacy-client inventory/cutoff, and privacy retention ownership remain unverified or owner actions. Passing CI does not establish pilot readiness.
 - Latest verified implementation SHA is `bcaa4c0afe3f97974a6920744808a7c38d110f24`; the handoff update is documentation-only and must be recorded separately. The next priority is human review of PR #1 and PR #2, then owner-led historical credential remediation and a device rollout plan before considering pilot deployment.
+
+## Phase 4 Controlled Pilot Preparation continuation (2026-10-17)
+
+- **Starting repository baseline:** Clean working tree on `main` at `8c96d873f0b8e2310e0666caa09a5a97ada49942`, which merged PR #3 ("Feature/device auth hardening (#3)"). PR #1, PR #2, and PR #3 are confirmed merged in GitHub. Feature branch `feature/controlled-pilot-preparation` was created directly from this reviewed baseline.
+- **Workflow triggers:** Updated `.github/workflows/postgres-integration.yml` to trigger push runs for `feature/controlled-pilot-preparation`.
+- **Software foundations implemented:**
+  1. **Device Registration API:** Added `POST /api/devices` in `server/src/routes/devices.js`. Requires active `devices_write` facility access, enforces unique device codes, creates the device in PostgreSQL, and logs an append-only `DEVICE_REGISTERED` audit event.
+  2. **Dedicated Device Observation Ingestion:** Added `POST /api/devices/:id/observations` in `server/src/routes/devices.js`. Authenticated via Ed25519 signature headers (`verifyDeviceIngestion`), bound by timestamp skew window (±300s), protected by transactional `(deviceId, requestId)` replay rejection, and records observations with `source: 'DEVICE_REPORT'` (preserving strict evidence provenance). Updates device health and triggers threshold alerts if CPU/temp limits are crossed.
+  3. **Device Health Diagnostics API:** Added `GET /api/devices/diagnostics` in `server/src/routes/devices.js`. Reports ping age in seconds, reporting status (`ONLINE` < 300s, `STALE` 300–900s, `OFFLINE` > 900s, `MAINTENANCE`, `DISABLED`), and active/revoked credential counts without exposing sensitive keys or tokens.
+  4. **Database Readiness Endpoint:** Added `GET /health/ready` in `server/src/index.js`. Executes `SELECT 1` via Prisma. Returns HTTP 200 `{ status: 'ready', database: 'connected' }` or HTTP 503 `{ status: 'not_ready', database: 'disconnected' }` without exposing internal database errors or connection strings.
+  5. **Graceful Process Shutdown:** Added `SIGTERM` and `SIGINT` signal handlers in `server/src/index.js` that stop accepting HTTP requests, drain Socket.IO, disconnect the Prisma connection pool, and exit cleanly with code 0.
+  6. **Redacted Diagnostic Logging:** Added `logDiagnostic` in `server/src/safeLogging.js` with regex-based masking (`/secret|token|password|auth|key|signature|body|rawBody|hash|digest|private/i`). Integrated diagnostic emission into `server/src/middleware/deviceAuth.js` so rejected signatures, expired timestamps, and replay attempts log correlation reasons to stdout while returning generic 401/409 responses to clients.
+  7. **Tenant Onboarding Dry-Run Utility:** Added `server/scripts/onboarding-dry-run.js` (executable via `npm run tenant:dry-run`). Inspects unassigned legacy facilities and unmapped users; validates proposed JSON onboarding plans; checks that facilities exist and are unassigned, organizations exist, and role assignments are valid; and guarantees no cross-tenant crossover without making database writes.
+  8. **Raspberry Pi Agent Hardening:** Updated `raspberry_pi/smartpark_agent.py` to support `BAYSIGNAL_ENDPOINT_PATH` (defaulting to `/api/devices/{DEVICE_ID}/observations`) and file-based private key loading via `BAYSIGNAL_DEVICE_PRIVATE_KEY_PATH` with POSIX file permission checks (`chmod 600`).
+  9. **Expanded Tests:** Added tests in `server/test/safeLogging.test.js`, `server/test/deviceAuth.test.js`, `server/test/postgres.integration.test.js`, and `raspberry_pi/test_device_signing.py`.
+- **Verification results:**
+  - `npm run test:unit` in `server/`: **37 passed, 0 failed, 1 optional PostgreSQL test skipped** (38 total).
+  - Client production build (`npm run build` in `client/`): **passed** (`dist/` generated cleanly in 7.6s).
+  - Prisma validation (`npx prisma validate` with placeholder env): **passed**.
+  - Production dependency audits (`npm audit --omit=dev`): **0 vulnerabilities** across both client and server trees.
+  - Syntax check (`node --check`): **passed across all changed and added files**.
+  - Whitespace check (`git diff --check`): **passed clean**.
+- **Deliverables updated/created:**
+  - `docs/PILOT_READINESS_CHECKLIST.md`: Structured pilot checklist with 10 explicit gates and 51 items categorized as `verified` (31), `pending owner action` (17), `blocked` (2), or `not applicable` (1).
+  - `docs/SECURITY_REVIEW.md`: Updated with Phase 4 security findings, owner-only credential remediation checklist, JWT rotation runbook, physical device provisioning/key storage architecture, and diagnostic redaction details.
+  - `docs/PRODUCTION_OPERATIONS.md`: Updated with one-device one-facility evidence workflow, tenant onboarding procedures, monitoring diagnostics, backup/restore runbooks, and 7-class privacy/retention inventory matrix.
+  - `docs/IMPLEMENTATION_HANDOFF.md`: Updated with verified facts.
+- **Production blockers and human actions remaining:**
+  - Historical credential remediation must be verified and executed by the repository owner on live services.
+  - Production PostgreSQL database with automated backups and point-in-time recovery must be funded (Render free tier is prohibited for pilot).
+  - Platform administrator must be bootstrapped via one-time script, and pilot organization and facility must be mapped.
+  - Physical Raspberry Pi hardware bench testing must be conducted before on-site installation.
+  - Retention policies must receive formal owner approval.
